@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 from collections import OrderedDict
 import threading
 import time
+import json
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -242,7 +243,13 @@ class PhotoMetadataEditor(QMainWindow):
         self._geocoding_results_ready = False
         self._pending_locations = None
         self._polling_active = False
-        
+
+        # Recent values storage
+        self.recent_values_file = os.path.expanduser("~/.photo_metadata_editor_recent_values.json")
+        self.recent_date_values = []
+        self.recent_location_values = []
+        self.load_recent_values()
+
         # Initialize UI
         self.setup_ui()
         self.setup_keyboard_shortcuts()
@@ -412,6 +419,13 @@ class PhotoMetadataEditor(QMainWindow):
         self.date_entry.installEventFilter(self)
         date_layout.addWidget(self.date_entry)
 
+        # Date recent values frame (always visible when there are recent values)
+        self.date_recent_frame = QFrame()
+        self.date_recent_layout = QVBoxLayout(self.date_recent_frame)
+        self.date_recent_layout.setContentsMargins(0, 0, 0, 0)
+        self.date_recent_frame.hide()
+        date_layout.addWidget(self.date_recent_frame)
+
         # Date suggestions frame (initially hidden)
         self.date_suggestions_frame = QFrame()
         self.date_suggestions_layout = QVBoxLayout(self.date_suggestions_frame)
@@ -473,8 +487,17 @@ class PhotoMetadataEditor(QMainWindow):
         self.location_entry = QLineEdit()
         self.location_entry.setPlaceholderText("Enter location name...")
         self.location_entry.textChanged.connect(self.on_location_change)
+        # Install event filter to handle Tab, Enter, and focus events
+        self.location_entry.installEventFilter(self)
         location_layout.addWidget(self.location_entry)
-        
+
+        # Location recent values frame (always visible when there are recent values)
+        self.location_recent_frame = QFrame()
+        self.location_recent_layout = QVBoxLayout(self.location_recent_frame)
+        self.location_recent_layout.setContentsMargins(0, 0, 0, 0)
+        self.location_recent_frame.hide()
+        location_layout.addWidget(self.location_recent_frame)
+
         # Location suggestions frame (initially hidden)
         self.location_suggestions_frame = QFrame()
         self.location_suggestions_layout = QVBoxLayout(self.location_suggestions_frame)
@@ -1062,6 +1085,12 @@ The application creates backup files (.backup) before modifying originals."""
             self.caption_text.textChanged.connect(self.on_caption_change)
             self.location_entry.textChanged.connect(self.on_location_change)
 
+            # Show recent values for empty fields
+            if not self.date_entry.text().strip():
+                self.show_date_recent_values()
+            if not self.location_entry.text().strip():
+                self.show_location_recent_values()
+
     def load_date_from_exif(self, exif_dict):
         """Load date from EXIF data."""
         try:
@@ -1154,8 +1183,12 @@ The application creates backup files (.backup) before modifying originals."""
             # Clear date from EXIF if empty
             self.schedule_metadata_save('date', None)
             self.hide_date_preview()
+            # Show recent values when field is empty
+            self.show_date_recent_values()
             return
 
+        # Hide recent values when user is typing
+        self.hide_date_recent_values()
         # Show real-time preview (but don't change the field content or auto-save)
         self.show_date_preview(date_text)
 
@@ -1199,7 +1232,7 @@ The application creates backup files (.backup) before modifying originals."""
         self.apply_date_confirmation(parsed_date)
 
     def eventFilter(self, obj, event):
-        """Handle events for date input field."""
+        """Handle events for date and location input fields."""
         if obj == self.date_entry:
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
@@ -1211,6 +1244,17 @@ The application creates backup files (.backup) before modifying originals."""
                     return False
             elif event.type() == QEvent.FocusOut:
                 self.on_date_focus_out()
+        elif obj == self.location_entry:
+            if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+                    self.on_location_enter_key()
+                    return True
+                elif event.key() == Qt.Key_Tab:
+                    self.on_location_tab_key()
+                    # Let Tab continue to next widget
+                    return False
+            elif event.type() == QEvent.FocusOut:
+                self.on_location_focus_out()
         return super().eventFilter(obj, event)
 
     def on_date_enter_key(self):
@@ -1241,14 +1285,46 @@ The application creates backup files (.backup) before modifying originals."""
         # Small delay to allow click on preview button
         QTimer.singleShot(100, self.hide_date_preview)
 
+    def on_location_enter_key(self):
+        """Handle Enter key press in location field."""
+        location_text = self.location_entry.text().strip()
+        if location_text:
+            # If there are suggestions, select the first one
+            if self.location_suggestions:
+                self.select_location_suggestion(self.location_suggestions[0])
+            else:
+                # Just try to geocode without adding to recent values yet
+                self.geocode_location(location_text)
+            # Move focus to next field (caption)
+            self.caption_text.setFocus()
+
+    def on_location_tab_key(self):
+        """Handle Tab key press in location field."""
+        location_text = self.location_entry.text().strip()
+        if location_text:
+            # If there are suggestions, select the first one
+            if self.location_suggestions:
+                self.select_location_suggestion(self.location_suggestions[0])
+            # Don't add to recent values for manual entry - only when suggestions are selected
+
+    def on_location_focus_out(self):
+        """Handle location field losing focus."""
+        # Don't add to recent values on focus out - only when suggestions are selected
+        # Small delay to allow click on suggestion button
+        QTimer.singleShot(100, self.hide_location_suggestions)
+        QTimer.singleShot(100, self.hide_location_recent_values)
+
     def apply_date_confirmation(self, parsed_date):
         """Apply confirmed date to field and save immediately."""
         if parsed_date:
             # Update entry field with formatted date
             formatted_date = parsed_date.strftime("%B %d, %Y")
             self.date_entry.setText(formatted_date)
-            # Hide preview
+            # Hide preview and recent values
             self.hide_date_preview()
+            self.hide_date_recent_values()
+            # Add to recent values
+            self.add_recent_date_value(formatted_date)
             # Save the date immediately
             self.save_date_immediately(parsed_date)
 
@@ -1305,7 +1381,12 @@ The application creates backup files (.backup) before modifying originals."""
             # Clear location from EXIF if empty
             self.schedule_metadata_save('location', None)
             self.hide_location_suggestions()
+            # Show recent values when field is empty
+            self.show_location_recent_values()
             return
+
+        # Hide recent values when user is typing
+        self.hide_location_recent_values()
 
         # Don't geocode very short text (less than 2 characters)
         if len(location_text) < 2:
@@ -1613,8 +1694,9 @@ The application creates backup files (.backup) before modifying originals."""
         # Update entry field
         self.location_entry.setText(location.address)
 
-        # Hide suggestions
+        # Hide suggestions and recent values
         self.hide_location_suggestions()
+        self.hide_location_recent_values()
 
         # Save location with coordinates
         location_data = {
@@ -1626,6 +1708,9 @@ The application creates backup files (.backup) before modifying originals."""
         # Store for future copying
         self._last_selected_location = location_data
 
+        # Add to recent values
+        self.add_recent_location_value(location.address)
+
         self.schedule_metadata_save('location', location_data)
         self.update_status("Location updated")
 
@@ -1634,9 +1719,168 @@ The application creates backup files (.backup) before modifying originals."""
         self.hide_location_suggestions()
         self.hide_date_preview()
 
+    def show_date_recent_values(self):
+        """Show recent date values dropdown."""
+        if not self.recent_date_values:
+            self.hide_date_recent_values()
+            return
+
+        # Clear existing recent value widgets
+        self.clear_date_recent_values()
+
+        # Show recent values frame
+        self.date_recent_frame.show()
+
+        # Add recent value buttons (in reverse order - most recent first)
+        for date_value in reversed(self.recent_date_values):
+            recent_btn = QPushButton(f"📅 {date_value}")
+            recent_btn.clicked.connect(lambda checked, val=date_value: self.select_date_recent_value(val))
+            recent_btn.setMinimumHeight(30)
+            recent_btn.setStyleSheet("QPushButton { text-align: left; padding: 5px; }")
+            self.date_recent_layout.addWidget(recent_btn)
+
+    def clear_date_recent_values(self):
+        """Clear all date recent value widgets."""
+        while self.date_recent_layout.count():
+            child = self.date_recent_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def hide_date_recent_values(self):
+        """Hide date recent values dropdown."""
+        self.date_recent_frame.hide()
+        self.clear_date_recent_values()
+
+    def show_location_recent_values(self):
+        """Show recent location values dropdown."""
+        if not self.recent_location_values:
+            self.hide_location_recent_values()
+            return
+
+        # Clear existing recent value widgets
+        self.clear_location_recent_values()
+
+        # Show recent values frame
+        self.location_recent_frame.show()
+
+        # Add recent value buttons (in reverse order - most recent first)
+        for location_value in reversed(self.recent_location_values):
+            recent_btn = QPushButton(f"📍 {location_value}")
+            recent_btn.clicked.connect(lambda checked, val=location_value: self.select_location_recent_value(val))
+            recent_btn.setMinimumHeight(30)
+            recent_btn.setStyleSheet("QPushButton { text-align: left; padding: 5px; }")
+            self.location_recent_layout.addWidget(recent_btn)
+
+    def clear_location_recent_values(self):
+        """Clear all location recent value widgets."""
+        while self.location_recent_layout.count():
+            child = self.location_recent_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def hide_location_recent_values(self):
+        """Hide location recent values dropdown."""
+        self.location_recent_frame.hide()
+        self.clear_location_recent_values()
+
+    def select_date_recent_value(self, date_value):
+        """Select a recent date value."""
+        # Update entry field
+        self.date_entry.setText(date_value)
+
+        # Hide recent values
+        self.hide_date_recent_values()
+
+        # Parse and apply the date (same logic as manual confirmation)
+        parsed_date = self.parse_natural_date(date_value)
+        if parsed_date:
+            self.apply_date_confirmation(parsed_date)
+
+        self.update_status("Recent date selected")
+
+    def select_location_recent_value(self, location_value):
+        """Select a recent location value."""
+        # Update entry field
+        self.location_entry.setText(location_value)
+
+        # Hide recent values
+        self.hide_location_recent_values()
+
+        # For recent location values, we need to geocode to get coordinates
+        # This will trigger the normal geocoding process, and if a suggestion
+        # is selected from that, it will be added to recent values again
+        # (which will move it to the top of the list)
+        self.geocode_location(location_value)
+
+        self.update_status("Recent location selected")
+
     def update_status(self, message: str):
         """Update the status bar."""
         self.status_bar.showMessage(message)
+
+    def load_recent_values(self):
+        """Load recent values from persistent storage."""
+        try:
+            if os.path.exists(self.recent_values_file):
+                with open(self.recent_values_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.recent_date_values = data.get('recent_dates', [])
+                    self.recent_location_values = data.get('recent_locations', [])
+                    # Ensure we only keep the last 3 values
+                    self.recent_date_values = self.recent_date_values[-3:]
+                    self.recent_location_values = self.recent_location_values[-3:]
+        except Exception as e:
+            print(f"[DEBUG] Error loading recent values: {e}")
+            self.recent_date_values = []
+            self.recent_location_values = []
+
+    def save_recent_values(self):
+        """Save recent values to persistent storage."""
+        try:
+            data = {
+                'recent_dates': self.recent_date_values,
+                'recent_locations': self.recent_location_values
+            }
+            with open(self.recent_values_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[DEBUG] Error saving recent values: {e}")
+
+    def add_recent_date_value(self, date_value):
+        """Add a new date value to recent values list."""
+        if not date_value:
+            return
+
+        # Remove if already exists to avoid duplicates
+        if date_value in self.recent_date_values:
+            self.recent_date_values.remove(date_value)
+
+        # Add to end of list
+        self.recent_date_values.append(date_value)
+
+        # Keep only last 3 values
+        self.recent_date_values = self.recent_date_values[-3:]
+
+        # Save to file
+        self.save_recent_values()
+
+    def add_recent_location_value(self, location_value):
+        """Add a new location value to recent values list."""
+        if not location_value:
+            return
+
+        # Remove if already exists to avoid duplicates
+        if location_value in self.recent_location_values:
+            self.recent_location_values.remove(location_value)
+
+        # Add to end of list
+        self.recent_location_values.append(location_value)
+
+        # Keep only last 3 values
+        self.recent_location_values = self.recent_location_values[-3:]
+
+        # Save to file
+        self.save_recent_values()
 
     def resizeEvent(self, event):
         """Handle window resize events."""
