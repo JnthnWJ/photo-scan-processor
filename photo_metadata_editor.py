@@ -186,6 +186,14 @@ class PhotoMetadataEditor:
         self.date_entry.pack(fill="x", padx=15, pady=(0, 10))
         self.date_entry.bind("<KeyRelease>", self.on_date_change)
         self.date_entry.bind("<Button-1>", lambda e: self.date_entry.focus_set())
+        self.date_entry.bind("<Return>", self.on_date_enter_key)
+        self.date_entry.bind("<FocusOut>", self.on_date_focus_out)
+        self.date_entry.bind("<Tab>", self.on_date_tab_key)
+
+        # Date preview dropdown frame
+        self.date_preview_frame = ctk.CTkFrame(date_frame)
+        self.date_preview_frame.pack(fill="x", padx=15, pady=(0, 10))
+        self.date_preview_frame.pack_forget()  # Initially hidden
 
         # Date format hint
         date_hint = ctk.CTkLabel(
@@ -267,7 +275,7 @@ class PhotoMetadataEditor:
         self.root.bind("<Right>", self.next_photo)
         self.root.bind("<Configure>", self.handle_window_resize)
         self.root.bind("<Control-o>", lambda e: self.select_folder())  # Ctrl+O to open folder
-        self.root.bind("<Escape>", lambda e: self.hide_location_suggestions())  # Esc to hide suggestions
+        self.root.bind("<Escape>", lambda e: self.hide_all_suggestions())  # Esc to hide suggestions
         self.root.focus_set()  # Ensure window can receive key events
 
         # Make sure the window can receive focus for keyboard events, but only when clicking on non-input areas
@@ -610,7 +618,7 @@ The application creates backup files (.backup) before modifying originals."""
             self.update_status("Already at last photo")
             
     def on_date_change(self, event=None):
-        """Handle date field changes."""
+        """Handle date field changes with real-time preview."""
         if not self.photo_files:
             return
 
@@ -618,20 +626,14 @@ The application creates backup files (.backup) before modifying originals."""
         if not date_text:
             # Clear date from EXIF if empty
             self.schedule_metadata_save('date', None)
+            self.hide_date_preview()
             return
 
-        try:
-            # Parse natural language date
-            parsed_date = self.parse_natural_date(date_text)
-            if parsed_date:
-                # Schedule auto-save
-                self.schedule_metadata_save('date', parsed_date)
-                self.update_status("Date updated")
-            else:
-                self.update_status("Invalid date format")
+        # Show real-time preview (but don't change the field content or auto-save)
+        self.show_date_preview(date_text)
 
-        except Exception as e:
-            self.update_status(f"Date parsing error: {str(e)}")
+        # Don't auto-save or format until user explicitly accepts the date
+        # This prevents interrupting the user's typing flow
 
     def parse_natural_date(self, date_text):
         """Parse natural language date input."""
@@ -657,6 +659,222 @@ The application creates backup files (.backup) before modifying originals."""
         except Exception:
             return None
 
+    def parse_date_with_preview(self, date_text):
+        """Parse date and return both parsed date and formatted preview text."""
+        try:
+            # Handle common formats
+            original_text = date_text.strip()
+            date_text = original_text.lower()
+
+            # Handle year-only input
+            if date_text.isdigit() and len(date_text) == 4:
+                year = int(date_text)
+                if 1900 <= year <= 2100:
+                    parsed_date = datetime(year, 1, 1)
+                    preview = parsed_date.strftime("%B %d, %Y")
+                    return parsed_date, preview
+
+            # Handle partial input with best guesses
+            if date_text.isdigit():
+                if len(date_text) == 1:
+                    # Single digit - could be month or day
+                    current_year = datetime.now().year
+                    month = int(date_text)
+                    if 1 <= month <= 12:
+                        parsed_date = datetime(current_year, month, 1)
+                        preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed current year)"
+                        return parsed_date, preview
+                elif len(date_text) == 2:
+                    # Two digits - could be year, month, or day
+                    num = int(date_text)
+                    current_year = datetime.now().year
+
+                    # If it's a reasonable month (1-12), assume it's a month
+                    if 1 <= num <= 12:
+                        parsed_date = datetime(current_year, num, 1)
+                        preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed current year)"
+                        return parsed_date, preview
+                    # If it's a reasonable day (13-31), assume it's a day in current month
+                    elif 13 <= num <= 31:
+                        current_month = datetime.now().month
+                        try:
+                            parsed_date = datetime(current_year, current_month, num)
+                            preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed current month/year)"
+                            return parsed_date, preview
+                        except ValueError:
+                            pass
+                    # Otherwise, assume it's a year (19xx or 20xx)
+                    else:
+                        if num <= 30:
+                            year = 2000 + num
+                        else:
+                            year = 1900 + num
+                        if 1900 <= year <= 2100:
+                            parsed_date = datetime(year, 1, 1)
+                            preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed year)"
+                            return parsed_date, preview
+
+            # Handle common partial formats
+            if '/' in date_text or '-' in date_text:
+                # Try to parse partial date formats
+                parts = date_text.replace('-', '/').split('/')
+                if len(parts) == 2:
+                    # Month/day or month/year
+                    try:
+                        num1, num2 = int(parts[0]), int(parts[1])
+                        current_year = datetime.now().year
+
+                        # If second number is a 4-digit year
+                        if 1900 <= num2 <= 2100:
+                            parsed_date = datetime(num2, num1, 1)
+                            preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed 1st day)"
+                            return parsed_date, preview
+                        # If first number could be month and second could be day
+                        elif 1 <= num1 <= 12 and 1 <= num2 <= 31:
+                            try:
+                                parsed_date = datetime(current_year, num1, num2)
+                                preview = f"{parsed_date.strftime('%B %d, %Y')} (assumed current year)"
+                                return parsed_date, preview
+                            except ValueError:
+                                pass
+                    except ValueError:
+                        pass
+
+            # Use dateutil parser for flexible parsing
+            parsed_date = date_parser.parse(original_text, fuzzy=True)
+
+            # Validate reasonable date range
+            if 1900 <= parsed_date.year <= 2100:
+                preview = parsed_date.strftime("%B %d, %Y")
+                return parsed_date, preview
+            else:
+                return None, "Date out of valid range (1900-2100)"
+
+        except Exception:
+            # Return a helpful message for invalid input
+            return None, "Invalid date format"
+
+    def show_date_preview(self, date_text):
+        """Show date preview dropdown."""
+        # Parse date and get preview
+        parsed_date, preview_text = self.parse_date_with_preview(date_text)
+
+        # Clear existing preview
+        for widget in self.date_preview_frame.winfo_children():
+            widget.destroy()
+
+        if not preview_text or preview_text == "Invalid date format":
+            self.hide_date_preview()
+            return
+
+        # Show preview frame
+        self.date_preview_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        # Create preview button
+        preview_btn = ctk.CTkButton(
+            self.date_preview_frame,
+            text=f"📅 {preview_text}",
+            height=30,
+            command=lambda: self.select_date_preview(parsed_date, preview_text)
+        )
+        preview_btn.pack(fill="x", pady=2)
+
+    def hide_date_preview(self, event=None):
+        """Hide date preview dropdown."""
+        self.date_preview_frame.pack_forget()
+
+    def select_date_preview(self, parsed_date, preview_text):
+        """Select the date preview and update the field."""
+        if parsed_date:
+            # Update entry field with formatted date
+            formatted_date = parsed_date.strftime("%B %d, %Y")
+            self.date_entry.delete(0, 'end')
+            self.date_entry.insert(0, formatted_date)
+
+            # Hide preview
+            self.hide_date_preview()
+
+            # Save the date immediately
+            self.save_date_immediately(parsed_date)
+
+    def on_date_enter_key(self, event=None):
+        """Handle Enter key press in date field."""
+        date_text = self.date_entry.get().strip()
+        if date_text:
+            parsed_date, preview_text = self.parse_date_with_preview(date_text)
+            if parsed_date:
+                self.select_date_preview(parsed_date, preview_text)
+                # Move focus to next field (caption)
+                self.caption_text.focus_set()
+            else:
+                # Still save what we can parse with the basic parser
+                basic_parsed = self.parse_natural_date(date_text)
+                if basic_parsed:
+                    self.save_date_immediately(basic_parsed)
+        return "break"  # Prevent default Enter behavior
+
+    def on_date_focus_out(self, event=None):
+        """Handle date field losing focus."""
+        # Accept the current date if it's valid
+        date_text = self.date_entry.get().strip()
+        if date_text:
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                self.save_date_immediately(parsed_date)
+
+        # Small delay to allow click on preview button
+        self.root.after(100, self.hide_date_preview)
+
+    def on_date_tab_key(self, event=None):
+        """Handle Tab key press in date field."""
+        # Accept current date if available
+        date_text = self.date_entry.get().strip()
+        if date_text:
+            parsed_date, preview_text = self.parse_date_with_preview(date_text)
+            if parsed_date:
+                self.select_date_preview(parsed_date, preview_text)
+            else:
+                # Still save what we can parse with the basic parser
+                basic_parsed = self.parse_natural_date(date_text)
+                if basic_parsed:
+                    self.save_date_immediately(basic_parsed)
+        # Let default Tab behavior continue
+        return None
+
+    def hide_all_suggestions(self):
+        """Hide all suggestion dropdowns."""
+        self.hide_location_suggestions()
+        self.hide_date_preview()
+
+    def update_date_field_display(self):
+        """Update the date field to show the final formatted date that will be saved."""
+        if not self.photo_files:
+            return
+
+        # Only update if the field is not currently focused (user is not actively typing)
+        if self.date_entry.focus_get() == self.date_entry:
+            return
+
+        # Get current date value from pending changes or parse current field
+        current_date = None
+        if 'date' in self.pending_changes:
+            current_date = self.pending_changes['date']
+        else:
+            # Try to parse current field content
+            date_text = self.date_entry.get().strip()
+            if date_text:
+                current_date = self.parse_natural_date(date_text)
+
+        if current_date:
+            # Format the date as it will appear in the final metadata
+            formatted_date = current_date.strftime("%B %d, %Y")
+
+            # Only update if different from current display
+            current_display = self.date_entry.get().strip()
+            if current_display != formatted_date:
+                self.date_entry.delete(0, 'end')
+                self.date_entry.insert(0, formatted_date)
+
     def schedule_metadata_save(self, field_type, value):
         """Schedule auto-save of metadata changes."""
         # Cancel existing timer
@@ -668,6 +886,17 @@ The application creates backup files (.backup) before modifying originals."""
 
         # Schedule save after 1 second delay
         self.auto_save_timer = self.root.after(1000, self.save_pending_metadata)
+
+    def save_date_immediately(self, parsed_date):
+        """Save date immediately without auto-formatting during typing."""
+        if not self.photo_files:
+            return
+
+        # Store the date change
+        self.pending_changes['date'] = parsed_date
+
+        # Save immediately without triggering the timer
+        self.save_pending_metadata()
 
     def save_pending_metadata(self):
         """Save pending metadata changes to EXIF."""
@@ -711,6 +940,11 @@ The application creates backup files (.backup) before modifying originals."""
             self.update_status("Metadata saved")
             self.pending_changes.clear()
 
+            # Only update date field display if the date field is not currently focused
+            # This prevents auto-formatting while the user is typing
+            if self.date_entry.focus_get() != self.date_entry:
+                self.update_date_field_display()
+
         except Exception as e:
             self.update_status(f"Error saving metadata: {str(e)}")
             self.autosave_label.configure(text="⚠ Error saving changes", text_color="red")
@@ -749,6 +983,9 @@ The application creates backup files (.backup) before modifying originals."""
         # Schedule auto-save
         self.schedule_metadata_save('caption', caption_text if caption_text else None)
         self.update_status("Caption updated")
+
+        # Update date field display to show final formatted date
+        self.update_date_field_display()
 
     def save_caption_to_exif(self, exif_dict, caption_value):
         """Save caption to EXIF data."""
@@ -852,6 +1089,9 @@ The application creates backup files (.backup) before modifying originals."""
         }
         self.schedule_metadata_save('location', location_data)
         self.update_status("Location updated")
+
+        # Update date field display to show final formatted date
+        self.update_date_field_display()
 
     def save_location_to_exif(self, exif_dict, location_data):
         """Save location to EXIF GPS data."""
