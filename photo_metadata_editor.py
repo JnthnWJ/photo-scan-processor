@@ -17,6 +17,9 @@ from geopy.geocoders import Nominatim
 import threading
 import time
 from typing import List, Optional, Dict, Any
+from functools import lru_cache
+import weakref
+from collections import OrderedDict
 
 
 class PhotoMetadataEditor:
@@ -40,6 +43,17 @@ class PhotoMetadataEditor:
         self.current_photo_index = 0
         self.current_image = None
         self.current_photo_ctk = None
+
+        # Image caching system
+        self.image_cache = OrderedDict()  # LRU cache for original images
+        self.scaled_cache = OrderedDict()  # LRU cache for scaled images
+        self.max_cache_size = 10  # Cache up to 10 images
+        self.max_scaled_cache_size = 20  # Cache more scaled versions
+
+        # Navigation debouncing
+        self._navigation_pending = False
+        self._last_navigation_time = 0
+        self._navigation_debounce_ms = 50  # 50ms debounce
         
         # Geocoder for location suggestions
         print(f"[DEBUG] Initializing Nominatim geocoder...")
@@ -67,6 +81,97 @@ class PhotoMetadataEditor:
         # Setup UI
         self.setup_ui()
         self.setup_keyboard_bindings()
+
+    def _manage_image_cache(self, cache_dict, max_size):
+        """Manage LRU cache by removing oldest entries when size limit is exceeded."""
+        while len(cache_dict) > max_size:
+            # Remove oldest entry (first item in OrderedDict)
+            oldest_key = next(iter(cache_dict))
+            removed_image = cache_dict.pop(oldest_key)
+            # Clean up PIL Image if it exists
+            if hasattr(removed_image, 'close'):
+                try:
+                    removed_image.close()
+                except:
+                    pass
+
+    def _get_cached_image(self, photo_path):
+        """Get image from cache or load and cache it."""
+        if photo_path in self.image_cache:
+            # Move to end (most recently used)
+            image = self.image_cache.pop(photo_path)
+            self.image_cache[photo_path] = image
+            return image
+
+        # Load image and add to cache
+        try:
+            image = Image.open(photo_path)
+            # Convert to RGB if necessary (for JPEG compatibility)
+            if image.mode not in ('RGB', 'L'):
+                image = image.convert('RGB')
+
+            # Add to cache
+            self.image_cache[photo_path] = image
+            self._manage_image_cache(self.image_cache, self.max_cache_size)
+
+            return image
+        except Exception as e:
+            raise e
+
+    def _get_cached_scaled_image(self, photo_path, target_size):
+        """Get scaled image from cache or create and cache it."""
+        cache_key = f"{photo_path}_{target_size[0]}x{target_size[1]}"
+
+        if cache_key in self.scaled_cache:
+            # Move to end (most recently used)
+            scaled_data = self.scaled_cache.pop(cache_key)
+            self.scaled_cache[cache_key] = scaled_data
+            return scaled_data
+
+        # Get original image (from cache or load)
+        original_image = self._get_cached_image(photo_path)
+
+        # Create scaled version
+        resized_image = original_image.resize(target_size, Image.Resampling.LANCZOS)
+
+        # Create CTkImage
+        ctk_image = ctk.CTkImage(
+            light_image=resized_image,
+            dark_image=resized_image,
+            size=target_size
+        )
+
+        scaled_data = {
+            'resized_image': resized_image,
+            'ctk_image': ctk_image,
+            'size': target_size
+        }
+
+        # Add to cache
+        self.scaled_cache[cache_key] = scaled_data
+        self._manage_image_cache(self.scaled_cache, self.max_scaled_cache_size)
+
+        return scaled_data
+
+    def _clear_image_caches(self):
+        """Clear all image caches and free memory."""
+        # Clear original image cache
+        for image in self.image_cache.values():
+            if hasattr(image, 'close'):
+                try:
+                    image.close()
+                except:
+                    pass
+        self.image_cache.clear()
+
+        # Clear scaled image cache
+        for scaled_data in self.scaled_cache.values():
+            if 'resized_image' in scaled_data and hasattr(scaled_data['resized_image'], 'close'):
+                try:
+                    scaled_data['resized_image'].close()
+                except:
+                    pass
+        self.scaled_cache.clear()
         
     def setup_ui(self):
         """Set up the user interface."""
@@ -397,13 +502,34 @@ The application creates backup files (.backup) before modifying originals."""
         if folder:
             self.load_folder(folder)
             
+    def _is_valid_image_file(self, file_path):
+        """Quick check if file is likely a valid image without full verification."""
+        try:
+            # Check file size (skip very small files that are likely not real images)
+            if os.path.getsize(file_path) < 1024:  # Less than 1KB
+                return False
+
+            # Quick header check for JPEG files
+            with open(file_path, 'rb') as f:
+                header = f.read(10)
+                # JPEG files start with FF D8 FF
+                if len(header) >= 3 and header[0:3] == b'\xff\xd8\xff':
+                    return True
+
+            return False
+        except Exception:
+            return False
+
     def load_folder(self, folder_path: str):
         """Load photos from the selected folder."""
         try:
+            # Clear caches when loading new folder
+            self._clear_image_caches()
+
             self.current_folder = folder_path
             self.folder_path_label.configure(text=f"Folder: {os.path.basename(folder_path)}")
 
-            # Find JPEG files recursively
+            # Find JPEG files recursively with lightweight validation
             self.photo_files = []
             supported_extensions = ('.jpg', '.jpeg', '.JPG', '.JPEG')
 
@@ -411,14 +537,9 @@ The application creates backup files (.backup) before modifying originals."""
                 for file in files:
                     if file.endswith(supported_extensions):
                         full_path = os.path.join(root, file)
-                        # Verify it's actually a valid image file
-                        try:
-                            with Image.open(full_path) as img:
-                                img.verify()  # Verify it's a valid image
+                        # Use lightweight validation instead of expensive img.verify()
+                        if self._is_valid_image_file(full_path):
                             self.photo_files.append(full_path)
-                        except Exception:
-                            # Skip invalid image files
-                            continue
 
             # Sort files by name for consistent ordering
             self.photo_files.sort(key=lambda x: os.path.basename(x).lower())
@@ -439,19 +560,15 @@ The application creates backup files (.backup) before modifying originals."""
             messagebox.showerror("Error", f"Failed to load folder: {str(e)}")
             
     def load_current_photo(self):
-        """Load and display the current photo."""
+        """Load and display the current photo using caching system."""
         if not self.photo_files:
             return
 
         photo_path = self.photo_files[self.current_photo_index]
 
         try:
-            # Load image
-            self.current_image = Image.open(photo_path)
-
-            # Convert to RGB if necessary (for JPEG compatibility)
-            if self.current_image.mode not in ('RGB', 'L'):
-                self.current_image = self.current_image.convert('RGB')
+            # Load image from cache
+            self.current_image = self._get_cached_image(photo_path)
 
             # Scale image to fit viewer
             self.display_scaled_image()
@@ -471,13 +588,16 @@ The application creates backup files (.backup) before modifying originals."""
             # Update copy button state
             self.update_copy_button_state()
 
+            # Preload adjacent images in background
+            self._preload_adjacent_images()
+
         except Exception as e:
             self.update_status(f"Error loading photo: {str(e)}")
             messagebox.showerror("Error", f"Failed to load photo {os.path.basename(photo_path)}: {str(e)}")
             
     def display_scaled_image(self):
-        """Scale and display the current image."""
-        if not self.current_image:
+        """Scale and display the current image using caching."""
+        if not self.current_image or not self.photo_files:
             return
 
         # Get viewer dimensions
@@ -497,27 +617,72 @@ The application creates backup files (.backup) before modifying originals."""
 
         new_width = int(img_width * scale)
         new_height = int(img_height * scale)
+        target_size = (new_width, new_height)
 
-        # Resize image
-        resized_image = self.current_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        # Get scaled image from cache
+        photo_path = self.photo_files[self.current_photo_index]
+        scaled_data = self._get_cached_scaled_image(photo_path, target_size)
 
-        # Create CTkImage for better compatibility
-        self.current_photo_ctk = ctk.CTkImage(
-            light_image=resized_image,
-            dark_image=resized_image,
-            size=(new_width, new_height)
-        )
+        # Use cached CTkImage
+        self.current_photo_ctk = scaled_data['ctk_image']
 
         # Update label
         self.photo_label.configure(image=self.current_photo_ctk, text="")
 
+    def _preload_adjacent_images(self):
+        """Preload adjacent images in background thread for faster navigation."""
+        if not self.photo_files:
+            return
+
+        def preload_worker():
+            try:
+                # Preload previous image
+                if self.current_photo_index > 0:
+                    prev_path = self.photo_files[self.current_photo_index - 1]
+                    if prev_path not in self.image_cache:
+                        self._get_cached_image(prev_path)
+
+                # Preload next image
+                if self.current_photo_index < len(self.photo_files) - 1:
+                    next_path = self.photo_files[self.current_photo_index + 1]
+                    if next_path not in self.image_cache:
+                        self._get_cached_image(next_path)
+
+            except Exception:
+                # Silently ignore preloading errors
+                pass
+
+        # Run preloading in background thread
+        threading.Thread(target=preload_worker, daemon=True).start()
+
     def handle_window_resize(self, event=None):
-        """Handle window resize events to rescale the image."""
+        """Handle window resize events to rescale the image with optimization."""
         if self.current_image and event and event.widget == self.root:
             # Delay the rescaling to avoid too many rapid updates
             if hasattr(self, '_resize_timer'):
                 self.root.after_cancel(self._resize_timer)
-            self._resize_timer = self.root.after(100, self.display_scaled_image)
+            self._resize_timer = self.root.after(200, self._handle_delayed_resize)
+
+    def _handle_delayed_resize(self):
+        """Handle delayed resize with cache invalidation for current image."""
+        if not self.photo_files or not self.current_image:
+            return
+
+        # Clear scaled cache entries for current image to force regeneration at new size
+        photo_path = self.photo_files[self.current_photo_index]
+        keys_to_remove = [key for key in self.scaled_cache.keys() if key.startswith(photo_path)]
+        for key in keys_to_remove:
+            if key in self.scaled_cache:
+                scaled_data = self.scaled_cache.pop(key)
+                # Clean up the resized image
+                if 'resized_image' in scaled_data and hasattr(scaled_data['resized_image'], 'close'):
+                    try:
+                        scaled_data['resized_image'].close()
+                    except:
+                        pass
+
+        # Redisplay with new size
+        self.display_scaled_image()
         
     def load_metadata(self):
         """Load metadata from the current photo."""
@@ -683,8 +848,53 @@ The application creates backup files (.backup) before modifying originals."""
         except Exception:
             return None
         
+    def _debounced_navigation(self, direction):
+        """Debounced navigation to prevent rapid key press issues."""
+        current_time = time.time() * 1000  # Convert to milliseconds
+
+        # If navigation is already pending, just update the direction and time
+        if self._navigation_pending:
+            self._last_navigation_time = current_time
+            self._pending_direction = direction
+            return
+
+        # Start navigation
+        self._navigation_pending = True
+        self._last_navigation_time = current_time
+        self._pending_direction = direction
+
+        # Schedule the actual navigation
+        self.root.after(self._navigation_debounce_ms, self._execute_navigation)
+
+    def _execute_navigation(self):
+        """Execute the pending navigation after debounce period."""
+        current_time = time.time() * 1000
+
+        # Check if enough time has passed since last navigation request
+        if current_time - self._last_navigation_time < self._navigation_debounce_ms:
+            # More navigation requests came in, wait a bit more
+            self.root.after(self._navigation_debounce_ms, self._execute_navigation)
+            return
+
+        # Execute the navigation
+        direction = self._pending_direction
+        self._navigation_pending = False
+
+        if direction == "previous":
+            self._navigate_previous()
+        elif direction == "next":
+            self._navigate_next()
+
     def previous_photo(self, event=None):
-        """Navigate to the previous photo."""
+        """Navigate to the previous photo with debouncing."""
+        self._debounced_navigation("previous")
+
+    def next_photo(self, event=None):
+        """Navigate to the next photo with debouncing."""
+        self._debounced_navigation("next")
+
+    def _navigate_previous(self):
+        """Internal method to navigate to previous photo."""
         if self.photo_files and self.current_photo_index > 0:
             # Store current metadata before navigating
             self.store_current_metadata()
@@ -695,8 +905,8 @@ The application creates backup files (.backup) before modifying originals."""
         elif self.photo_files:
             self.update_status("Already at first photo")
 
-    def next_photo(self, event=None):
-        """Navigate to the next photo."""
+    def _navigate_next(self):
+        """Internal method to navigate to next photo."""
         if self.photo_files and self.current_photo_index < len(self.photo_files) - 1:
             # Store current metadata before navigating
             self.store_current_metadata()
@@ -1597,6 +1807,19 @@ The application creates backup files (.backup) before modifying originals."""
         # Save any pending changes
         if self.pending_changes:
             self.save_pending_metadata()
+
+        # Clean up image caches and free memory
+        self._clear_image_caches()
+
+        # Clean up current image references
+        if hasattr(self, 'current_image') and self.current_image:
+            try:
+                self.current_image.close()
+            except:
+                pass
+
+        # Clean up CTkImage reference
+        self.current_photo_ctk = None
 
 
 def main():
