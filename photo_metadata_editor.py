@@ -502,7 +502,6 @@ The application creates backup files (.backup) before modifying originals."""
             # Try different EXIF date fields
             date_fields = [
                 exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal),
-                exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTime),
                 exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
             ]
 
@@ -724,7 +723,6 @@ The application creates backup files (.backup) before modifying originals."""
             # Remove date fields
             if "Exif" in exif_dict:
                 exif_dict["Exif"].pop(piexif.ExifIFD.DateTimeOriginal, None)
-                exif_dict["Exif"].pop(piexif.ExifIFD.DateTime, None)
             if "0th" in exif_dict:
                 exif_dict["0th"].pop(piexif.ImageIFD.DateTime, None)
         else:
@@ -739,7 +737,6 @@ The application creates backup files (.backup) before modifying originals."""
 
             # Set date in multiple fields for compatibility
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = date_str
-            exif_dict["Exif"][piexif.ExifIFD.DateTime] = date_str
             exif_dict["0th"][piexif.ImageIFD.DateTime] = date_str
         
     def on_caption_change(self, event=None):
