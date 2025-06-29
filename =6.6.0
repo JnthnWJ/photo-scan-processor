@@ -1,0 +1,12 @@
+Collecting PySide6
+  Downloading PySide6-6.9.1-cp39-abi3-macosx_12_0_universal2.whl.metadata (5.3 kB)
+Collecting shiboken6==6.9.1 (from PySide6)
+  Downloading shiboken6-6.9.1-cp39-abi3-macosx_12_0_universal2.whl.metadata (2.4 kB)
+Collecting PySide6-Essentials==6.9.1 (from PySide6)
+  Downloading PySide6_Essentials-6.9.1-cp39-abi3-macosx_12_0_universal2.whl.metadata (3.6 kB)
+Collecting PySide6-Addons==6.9.1 (from PySide6)
+  Downloading PySide6_Addons-6.9.1-cp39-abi3-macosx_12_0_universal2.whl.metadata (4.0 kB)
+Downloading PySide6-6.9.1-cp39-abi3-macosx_12_0_universal2.whl (558 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 558.1/558.1 kB 1.0 MB/s eta 0:00:00
+Downloading PySide6_Addons-6.9.1-cp39-abi3-macosx_12_0_universal2.whl (316.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸ 316.1/316.2 MB 2.0 MB/s eta 0:00:01
