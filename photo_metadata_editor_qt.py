@@ -301,7 +301,7 @@ class PhotoMetadataEditor(QMainWindow):
         toolbar.addSeparator()
         
         # Folder path label
-        self.folder_path_label = QLabel("No folder selected - Press Ctrl+O or click 'Select Folder'")
+        self.folder_path_label = QLabel("No folder selected - Press Cmd+O or click 'Select Folder'")
         self.folder_path_label.setStyleSheet("QLabel { margin-left: 10px; }")
         toolbar.addWidget(self.folder_path_label)
         
@@ -507,19 +507,19 @@ class PhotoMetadataEditor(QMainWindow):
     def setup_keyboard_shortcuts(self):
         """Set up keyboard shortcuts."""
         # Navigation shortcuts
-        left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
-        left_shortcut.activated.connect(self.previous_photo)
-        
-        right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
-        right_shortcut.activated.connect(self.next_photo)
-        
+        self.left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
+        self.left_shortcut.activated.connect(self.previous_photo)
+
+        self.right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
+        self.right_shortcut.activated.connect(self.next_photo)
+
         # File operations
-        open_shortcut = QShortcut(QKeySequence.Open, self)
-        open_shortcut.activated.connect(self.select_folder)
-        
+        self.open_shortcut = QShortcut(QKeySequence.Open, self)
+        self.open_shortcut.activated.connect(self.select_folder)
+
         # Hide suggestions
-        escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
-        escape_shortcut.activated.connect(self.hide_all_suggestions)
+        self.escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self.escape_shortcut.activated.connect(self.hide_all_suggestions)
 
     def show_help(self):
         """Show help dialog."""
@@ -527,7 +527,7 @@ class PhotoMetadataEditor(QMainWindow):
 
 NAVIGATION:
 • Use ← → arrow keys to navigate between photos
-• Click 'Select Folder' or press Ctrl+O to choose a photo folder
+• Click 'Select Folder' or press Cmd+O to choose a photo folder
 
 METADATA EDITING:
 • Date: Enter dates in natural language (e.g., "2001", "5/11/01", "jan 1 2001")
@@ -543,7 +543,7 @@ FEATURES:
 • Copy metadata between photos for batch processing
 
 KEYBOARD SHORTCUTS:
-• Ctrl+O: Open folder
+• Cmd+O: Open folder
 • ← →: Navigate photos
 • Esc: Hide location suggestions
 
