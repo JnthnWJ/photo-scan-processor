@@ -59,7 +59,11 @@ class PhotoMetadataEditor:
         # Auto-save timer
         self.auto_save_timer = None
         self.pending_changes = {}
-        
+
+        # Previous photo metadata storage for "Copy from Previous" feature
+        self.previous_photo_metadata = None
+        self._last_selected_location = None
+
         # Setup UI
         self.setup_ui()
         self.setup_keyboard_bindings()
@@ -173,6 +177,9 @@ class PhotoMetadataEditor:
         # Location field
         self.create_location_field()
 
+        # Copy from Previous button
+        self.create_copy_from_previous_button()
+
         # Auto-save status
         self.autosave_label = ctk.CTkLabel(
             self.metadata_scroll,
@@ -273,7 +280,31 @@ class PhotoMetadataEditor:
             text_color="gray"
         )
         location_hint.pack(anchor="w", padx=15, pady=(0, 15))
-        
+
+    def create_copy_from_previous_button(self):
+        """Create the Copy from Previous button."""
+        copy_frame = ctk.CTkFrame(self.metadata_scroll)
+        copy_frame.pack(fill="x", pady=20)
+
+        self.copy_from_previous_btn = ctk.CTkButton(
+            copy_frame,
+            text="📋 Copy from Previous Photo",
+            command=self.copy_from_previous_photo,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            state="disabled"  # Initially disabled
+        )
+        self.copy_from_previous_btn.pack(padx=15, pady=15)
+
+        # Hint text
+        self.copy_hint_label = ctk.CTkLabel(
+            copy_frame,
+            text="Copies date, caption, and location from the previous photo",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        )
+        self.copy_hint_label.pack(padx=15, pady=(0, 15))
+
     def create_status_bar(self):
         """Create the status bar."""
         self.status_frame = ctk.CTkFrame(self.root)
@@ -342,12 +373,14 @@ METADATA EDITING:
 • Date: Enter dates in natural language (e.g., "2001", "5/11/01", "jan 1 2001")
 • Caption: Add descriptions that will appear in Apple Photos
 • Location: Type location names for GPS coordinates and suggestions
+• Copy from Previous: Click to copy all metadata from the previously viewed photo
 
 FEATURES:
 • All changes are saved automatically to EXIF data
 • Metadata is compatible with Apple Photos
 • GPS coordinates are added for location entries
 • Supports JPEG files with EXIF data
+• Copy metadata between photos for batch processing
 
 KEYBOARD SHORTCUTS:
 • Ctrl+O: Open folder
@@ -435,6 +468,9 @@ The application creates backup files (.backup) before modifying originals."""
             # Update window title
             self.root.title(f"Photo Metadata Editor - {filename}")
 
+            # Update copy button state
+            self.update_copy_button_state()
+
         except Exception as e:
             self.update_status(f"Error loading photo: {str(e)}")
             messagebox.showerror("Error", f"Failed to load photo {os.path.basename(photo_path)}: {str(e)}")
@@ -495,6 +531,9 @@ The application creates backup files (.backup) before modifying originals."""
             self.date_entry.delete(0, 'end')
             self.caption_text.delete("1.0", 'end')
             self.location_entry.delete(0, 'end')
+
+            # Clear last selected location data
+            self._last_selected_location = None
 
             # Update photo info
             file_size = os.path.getsize(photo_path)
@@ -567,34 +606,62 @@ The application creates backup files (.backup) before modifying originals."""
             pass  # No caption found or error parsing
 
     def load_location_from_exif(self, exif_dict):
-        """Load location from EXIF GPS data."""
+        """Load location from EXIF GPS data or text."""
         try:
+            # First try to load GPS coordinates
             gps_info = exif_dict.get("GPS", {})
-            if not gps_info:
-                return
+            if gps_info:
+                # Extract GPS coordinates
+                lat = self.convert_gps_coordinate(
+                    gps_info.get(piexif.GPSIFD.GPSLatitude),
+                    gps_info.get(piexif.GPSIFD.GPSLatitudeRef)
+                )
+                lon = self.convert_gps_coordinate(
+                    gps_info.get(piexif.GPSIFD.GPSLongitude),
+                    gps_info.get(piexif.GPSIFD.GPSLongitudeRef)
+                )
 
-            # Extract GPS coordinates
-            lat = self.convert_gps_coordinate(
-                gps_info.get(piexif.GPSIFD.GPSLatitude),
-                gps_info.get(piexif.GPSIFD.GPSLatitudeRef)
-            )
-            lon = self.convert_gps_coordinate(
-                gps_info.get(piexif.GPSIFD.GPSLongitude),
-                gps_info.get(piexif.GPSIFD.GPSLongitudeRef)
-            )
+                if lat is not None and lon is not None:
+                    # Try to reverse geocode to get location name
+                    try:
+                        location = self.geocoder.reverse(f"{lat}, {lon}", timeout=5)
+                        if location:
+                            self.location_entry.insert(0, location.address)
+                            # Store the location data for copying
+                            self._last_selected_location = {
+                                'address': location.address,
+                                'latitude': lat,
+                                'longitude': lon
+                            }
+                            return
+                    except Exception:
+                        # If reverse geocoding fails, just show coordinates
+                        self.location_entry.insert(0, f"{lat:.6f}, {lon:.6f}")
+                        # Store the coordinate data for copying
+                        self._last_selected_location = {
+                            'address': f"{lat:.6f}, {lon:.6f}",
+                            'latitude': lat,
+                            'longitude': lon
+                        }
+                        return
 
-            if lat is not None and lon is not None:
-                # Try to reverse geocode to get location name
+            # If no GPS coordinates, try to load text-only location from GPS ProcessingMethod
+            gps_processing_method = gps_info.get(piexif.GPSIFD.GPSProcessingMethod)
+            if gps_processing_method:
                 try:
-                    location = self.geocoder.reverse(f"{lat}, {lon}", timeout=5)
-                    if location:
-                        self.location_entry.insert(0, location.address)
+                    if isinstance(gps_processing_method, bytes):
+                        location_text = gps_processing_method.decode('utf-8', errors='ignore')
+                    else:
+                        location_text = str(gps_processing_method)
+
+                    if location_text.strip():
+                        self.location_entry.insert(0, location_text.strip())
+                        return
                 except Exception:
-                    # If reverse geocoding fails, just show coordinates
-                    self.location_entry.insert(0, f"{lat:.6f}, {lon:.6f}")
+                    pass
 
         except Exception as e:
-            pass  # No GPS data found or error parsing
+            pass  # No location data found or error parsing
 
     def convert_gps_coordinate(self, coord_tuple, ref):
         """Convert GPS coordinate from EXIF format to decimal degrees."""
@@ -619,8 +686,11 @@ The application creates backup files (.backup) before modifying originals."""
     def previous_photo(self, event=None):
         """Navigate to the previous photo."""
         if self.photo_files and self.current_photo_index > 0:
+            # Store current metadata before navigating
+            self.store_current_metadata()
             self.current_photo_index -= 1
             self.load_current_photo()
+            self.update_copy_button_state()
             self.update_status(f"Photo {self.current_photo_index + 1} of {len(self.photo_files)}")
         elif self.photo_files:
             self.update_status("Already at first photo")
@@ -628,12 +698,112 @@ The application creates backup files (.backup) before modifying originals."""
     def next_photo(self, event=None):
         """Navigate to the next photo."""
         if self.photo_files and self.current_photo_index < len(self.photo_files) - 1:
+            # Store current metadata before navigating
+            self.store_current_metadata()
             self.current_photo_index += 1
             self.load_current_photo()
+            self.update_copy_button_state()
             self.update_status(f"Photo {self.current_photo_index + 1} of {len(self.photo_files)}")
         elif self.photo_files:
             self.update_status("Already at last photo")
-            
+
+    def store_current_metadata(self):
+        """Store current metadata for the 'Copy from Previous' feature."""
+        if not self.photo_files:
+            return
+
+        # Get current metadata from the UI fields
+        current_metadata = {}
+
+        # Get date
+        date_text = self.date_entry.get().strip()
+        if date_text:
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                current_metadata['date'] = parsed_date
+                current_metadata['date_text'] = date_text
+
+        # Get caption
+        caption_text = self.caption_text.get("1.0", 'end-1c').strip()
+        if caption_text:
+            current_metadata['caption'] = caption_text
+
+        # Get location
+        location_text = self.location_entry.get().strip()
+        if location_text:
+            current_metadata['location'] = location_text
+            # Also try to get coordinates if available from the last geocoding
+            if hasattr(self, '_last_selected_location') and self._last_selected_location:
+                current_metadata['location_data'] = {
+                    'address': self._last_selected_location.get('address', location_text),
+                    'latitude': self._last_selected_location.get('latitude'),
+                    'longitude': self._last_selected_location.get('longitude')
+                }
+
+        # Store the metadata
+        self.previous_photo_metadata = current_metadata
+
+    def update_copy_button_state(self):
+        """Update the state of the Copy from Previous button."""
+        if self.previous_photo_metadata and len(self.previous_photo_metadata) > 0:
+            self.copy_from_previous_btn.configure(state="normal")
+            # Update hint text to show what will be copied
+            fields_to_copy = []
+            if 'date' in self.previous_photo_metadata:
+                fields_to_copy.append("date")
+            if 'caption' in self.previous_photo_metadata:
+                fields_to_copy.append("caption")
+            if 'location' in self.previous_photo_metadata:
+                fields_to_copy.append("location")
+
+            if fields_to_copy:
+                hint_text = f"Will copy: {', '.join(fields_to_copy)} from previous photo"
+                self.copy_hint_label.configure(text=hint_text)
+            else:
+                self.copy_hint_label.configure(text="No metadata available from previous photo")
+        else:
+            self.copy_from_previous_btn.configure(state="disabled")
+            self.copy_hint_label.configure(text="Copies date, caption, and location from the previous photo")
+
+    def copy_from_previous_photo(self):
+        """Copy metadata from the previous photo to the current photo."""
+        if not self.previous_photo_metadata or not self.photo_files:
+            return
+
+        # Copy date
+        if 'date_text' in self.previous_photo_metadata:
+            self.date_entry.delete(0, 'end')
+            self.date_entry.insert(0, self.previous_photo_metadata['date_text'])
+            # Save the date immediately
+            if 'date' in self.previous_photo_metadata:
+                self.save_date_immediately(self.previous_photo_metadata['date'])
+
+        # Copy caption
+        if 'caption' in self.previous_photo_metadata:
+            self.caption_text.delete("1.0", 'end')
+            self.caption_text.insert("1.0", self.previous_photo_metadata['caption'])
+            self.schedule_metadata_save('caption', self.previous_photo_metadata['caption'])
+
+        # Copy location
+        if 'location' in self.previous_photo_metadata:
+            self.location_entry.delete(0, 'end')
+            self.location_entry.insert(0, self.previous_photo_metadata['location'])
+
+            # Use location data with coordinates if available, otherwise just save as text
+            if 'location_data' in self.previous_photo_metadata:
+                location_data = self.previous_photo_metadata['location_data']
+                self.schedule_metadata_save('location', location_data)
+            else:
+                # For text-only location (no coordinates), don't save to EXIF GPS fields
+                # Just keep the text in the UI field for user reference
+                pass
+
+        # Show success feedback
+        self.autosave_label.configure(text="✓ Metadata copied from previous photo", text_color="green")
+        self.root.after(3000, lambda: self.autosave_label.configure(
+            text="Changes are saved automatically", text_color="gray"))
+        self.update_status("Metadata copied from previous photo")
+
     def on_date_change(self, event=None):
         """Handle date field changes with real-time preview."""
         if not self.photo_files:
@@ -1296,6 +1466,10 @@ The application creates backup files (.backup) before modifying originals."""
             'latitude': location.latitude,
             'longitude': location.longitude
         }
+
+        # Store for future copying
+        self._last_selected_location = location_data
+
         self.schedule_metadata_save('location', location_data)
         self.update_status("Location updated")
 
@@ -1303,28 +1477,41 @@ The application creates backup files (.backup) before modifying originals."""
         self.update_date_field_display()
 
     def save_location_to_exif(self, exif_dict, location_data):
-        """Save location to EXIF GPS data."""
+        """Save location to EXIF GPS data or as text."""
         if location_data is None:
-            # Remove GPS data
+            # Remove GPS data completely
             if "GPS" in exif_dict:
                 del exif_dict["GPS"]
         else:
-            # Ensure GPS dictionary exists
-            if "GPS" not in exif_dict:
-                exif_dict["GPS"] = {}
+            # Check if we have coordinates
+            if 'latitude' in location_data and 'longitude' in location_data and location_data['latitude'] is not None and location_data['longitude'] is not None:
+                # Save GPS coordinates
+                # Ensure GPS dictionary exists
+                if "GPS" not in exif_dict:
+                    exif_dict["GPS"] = {}
 
-            lat = location_data['latitude']
-            lon = location_data['longitude']
+                lat = location_data['latitude']
+                lon = location_data['longitude']
 
-            # Convert decimal degrees to GPS format
-            lat_deg, lat_min, lat_sec = self.decimal_to_gps(abs(lat))
-            lon_deg, lon_min, lon_sec = self.decimal_to_gps(abs(lon))
+                # Convert decimal degrees to GPS format
+                lat_deg, lat_min, lat_sec = self.decimal_to_gps(abs(lat))
+                lon_deg, lon_min, lon_sec = self.decimal_to_gps(abs(lon))
 
-            # Set GPS data
-            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = [(lat_deg, 1), (lat_min, 1), (int(lat_sec * 1000), 1000)]
-            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = 'N' if lat >= 0 else 'S'
-            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = [(lon_deg, 1), (lon_min, 1), (int(lon_sec * 1000), 1000)]
-            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = 'E' if lon >= 0 else 'W'
+                # Set GPS data
+                exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = [(lat_deg, 1), (lat_min, 1), (int(lat_sec * 1000), 1000)]
+                exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = 'N' if lat >= 0 else 'S'
+                exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = [(lon_deg, 1), (lon_min, 1), (int(lon_sec * 1000), 1000)]
+                exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = 'E' if lon >= 0 else 'W'
+            else:
+                # Save as text-only location in GPS ProcessingMethod field
+                if 'address' in location_data:
+                    # Ensure GPS dictionary exists
+                    if "GPS" not in exif_dict:
+                        exif_dict["GPS"] = {}
+
+                    # Save location text in GPS ProcessingMethod field
+                    location_text = location_data['address']
+                    exif_dict["GPS"][piexif.GPSIFD.GPSProcessingMethod] = location_text.encode('utf-8')
 
     def decimal_to_gps(self, decimal_coord):
         """Convert decimal coordinate to GPS degrees, minutes, seconds."""
