@@ -52,6 +52,18 @@ class PhotoMetadataEditor(QMainWindow):
         self.auto_save_timer = QTimer()
         self.auto_save_timer.setSingleShot(True)
         self.auto_save_timer.timeout.connect(self.save_pending_metadata)
+
+        # Navigation debouncing
+        self._navigation_pending = False
+        self._last_navigation_time = 0
+        self._navigation_debounce_ms = 50  # 50ms debounce
+        self._pending_direction = None
+        self._navigation_timer = QTimer()
+        self._navigation_timer.setSingleShot(True)
+        self._navigation_timer.timeout.connect(self._execute_navigation)
+
+        # Metadata loading state
+        self._metadata_loaded = False
         
         # Geocoder for location suggestions
         print(f"[DEBUG] Initializing Nominatim geocoder...")
@@ -602,13 +614,63 @@ The application creates backup files (.backup) before modifying originals."""
         # Run preloading in background thread
         threading.Thread(target=preload_worker, daemon=True).start()
 
+    def _debounced_navigation(self, direction):
+        """Debounced navigation to prevent rapid key press issues."""
+        import time
+        current_time = time.time() * 1000  # Convert to milliseconds
+
+        # If navigation is already pending, just update the direction and time
+        if self._navigation_pending:
+            self._last_navigation_time = current_time
+            self._pending_direction = direction
+            return
+
+        # Start navigation
+        self._navigation_pending = True
+        self._last_navigation_time = current_time
+        self._pending_direction = direction
+
+        # Schedule the actual navigation
+        self._navigation_timer.start(self._navigation_debounce_ms)
+
+    def _execute_navigation(self):
+        """Execute the pending navigation after debounce period."""
+        import time
+        current_time = time.time() * 1000
+
+        # Check if enough time has passed since last navigation request
+        if current_time - self._last_navigation_time < self._navigation_debounce_ms:
+            # More navigation requests came in, wait a bit more
+            self._navigation_timer.start(self._navigation_debounce_ms)
+            return
+
+        # Execute the navigation
+        direction = self._pending_direction
+        self._navigation_pending = False
+
+        if direction == "previous":
+            self._navigate_previous()
+        elif direction == "next":
+            self._navigate_next()
+
     def previous_photo(self):
-        """Navigate to the previous photo."""
+        """Navigate to the previous photo with debouncing."""
+        self._debounced_navigation("previous")
+
+    def next_photo(self):
+        """Navigate to the next photo with debouncing."""
+        self._debounced_navigation("next")
+
+    def _navigate_previous(self):
+        """Internal method to navigate to previous photo."""
         if not self.photo_files:
             return
 
         if self.current_photo_index > 0:
-            # Store current photo metadata before navigating
+            # Save any pending changes before navigating to prevent data loss
+            self._save_pending_changes_before_navigation()
+
+            # Store current photo metadata for "Copy from Previous" feature
             self.store_current_photo_metadata()
 
             self.current_photo_index -= 1
@@ -616,19 +678,30 @@ The application creates backup files (.backup) before modifying originals."""
         else:
             self.update_status("Already at first photo")
 
-    def next_photo(self):
-        """Navigate to the next photo."""
+    def _navigate_next(self):
+        """Internal method to navigate to next photo."""
         if not self.photo_files:
             return
 
         if self.current_photo_index < len(self.photo_files) - 1:
-            # Store current photo metadata before navigating
+            # Save any pending changes before navigating to prevent data loss
+            self._save_pending_changes_before_navigation()
+
+            # Store current photo metadata for "Copy from Previous" feature
             self.store_current_photo_metadata()
 
             self.current_photo_index += 1
             self.load_current_photo()
         else:
             self.update_status("Already at last photo")
+
+    def _save_pending_changes_before_navigation(self):
+        """Save any pending metadata changes before navigating to prevent data loss."""
+        if self.pending_changes:
+            # Stop the auto-save timer to prevent race conditions
+            self.auto_save_timer.stop()
+            # Save immediately
+            self.save_pending_metadata()
 
     def store_current_photo_metadata(self):
         """Store current photo metadata for copying to next photo."""
@@ -704,6 +777,14 @@ The application creates backup files (.backup) before modifying originals."""
         photo_path = self.photo_files[self.current_photo_index]
 
         try:
+            # Mark metadata as not loaded during the loading process
+            self._metadata_loaded = False
+
+            # Temporarily disconnect signals to prevent triggering saves during field clearing
+            self.date_entry.textChanged.disconnect()
+            self.caption_text.textChanged.disconnect()
+            self.location_entry.textChanged.disconnect()
+
             # Clear existing metadata fields
             self.date_entry.clear()
             self.caption_text.clear()
@@ -734,8 +815,19 @@ The application creates backup files (.backup) before modifying originals."""
             # Load location from EXIF
             self.load_location_from_exif(exif_dict)
 
+            # Mark metadata as successfully loaded
+            self._metadata_loaded = True
+
         except Exception as e:
             self.update_status(f"Error loading metadata: {str(e)}")
+            # Even on error, mark as loaded to prevent saving empty data
+            self._metadata_loaded = True
+
+        finally:
+            # Always reconnect the signals after loading, regardless of success/failure
+            self.date_entry.textChanged.connect(self.on_date_change)
+            self.caption_text.textChanged.connect(self.on_caption_change)
+            self.location_entry.textChanged.connect(self.on_location_change)
 
     def load_date_from_exif(self, exif_dict):
         """Load date from EXIF data."""
@@ -900,6 +992,11 @@ The application creates backup files (.backup) before modifying originals."""
     def save_pending_metadata(self):
         """Save pending metadata changes to EXIF."""
         if not self.pending_changes or not self.photo_files:
+            return
+
+        # Don't save if metadata hasn't been properly loaded yet
+        # This prevents saving empty data during rapid navigation
+        if not self._metadata_loaded:
             return
 
         photo_path = self.photo_files[self.current_photo_index]
@@ -1211,6 +1308,8 @@ The application creates backup files (.backup) before modifying originals."""
         # Stop any running timers
         if hasattr(self, 'auto_save_timer'):
             self.auto_save_timer.stop()
+        if hasattr(self, '_navigation_timer'):
+            self._navigation_timer.stop()
         if hasattr(self, '_geocoding_timer'):
             self._geocoding_timer.stop()
         if hasattr(self, '_polling_timer'):
