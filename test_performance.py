@@ -67,7 +67,7 @@ def performance_test_instructions():
     print("\nThis script has created test images for performance testing.")
     print("To test the optimizations:")
     print("\n1. Run the photo metadata editor:")
-    print("   python photo_metadata_editor.py")
+    print("   python photo_metadata_editor_qt.py")
     print("\n2. Select the test folder when prompted")
     print("\n3. Test rapid navigation:")
     print("   - Hold down the RIGHT arrow key for 5-10 seconds")

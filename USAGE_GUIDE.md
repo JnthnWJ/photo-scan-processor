@@ -106,9 +106,10 @@ The application writes metadata to EXIF fields that Apple Photos recognizes:
 ### Dependencies
 - **Pillow**: Image processing and basic EXIF handling
 - **piexif**: Advanced EXIF data manipulation
-- **customtkinter**: Modern GUI framework
+- **PySide6**: Modern Qt-based GUI framework
 - **geopy**: Geocoding services
 - **python-dateutil**: Natural language date parsing
+- **requests**: HTTP requests for geocoding API
 
 ## Tips for Batch Processing
 
