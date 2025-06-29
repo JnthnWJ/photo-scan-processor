@@ -942,20 +942,17 @@ The application creates backup files (.backup) before modifying originals."""
         location_text = self.location_entry.get().strip()
         if location_text:
             current_metadata['location'] = location_text
-            # Also try to get coordinates if available from the last geocoding
-            if hasattr(self, '_last_selected_location') and self._last_selected_location:
+            # Only store location_data if we have valid coordinates
+            if (hasattr(self, '_last_selected_location') and self._last_selected_location and
+                self._last_selected_location.get('latitude') is not None and
+                self._last_selected_location.get('longitude') is not None):
                 current_metadata['location_data'] = {
                     'address': self._last_selected_location.get('address', location_text),
                     'latitude': self._last_selected_location.get('latitude'),
                     'longitude': self._last_selected_location.get('longitude')
                 }
-            else:
-                # For text-only locations, create location_data without coordinates
-                current_metadata['location_data'] = {
-                    'address': location_text,
-                    'latitude': None,
-                    'longitude': None
-                }
+            # Note: Text-only locations without coordinates are not stored in location_data
+            # as they cannot be properly saved to EXIF GPS fields for Apple Photos compatibility
 
         # Store the metadata
         self.previous_photo_metadata = current_metadata
@@ -1006,25 +1003,92 @@ The application creates backup files (.backup) before modifying originals."""
             self.location_entry.delete(0, 'end')
             self.location_entry.insert(0, self.previous_photo_metadata['location'])
 
-            # Use location data with coordinates if available, otherwise save as text-only
+            # Only save locations that have coordinates (Apple Photos compatible)
             if 'location_data' in self.previous_photo_metadata:
                 location_data = self.previous_photo_metadata['location_data']
-                # Update the last selected location for future copying
-                self._last_selected_location = location_data
-                self.save_location_immediately(location_data)
+                # Check if we have valid coordinates
+                if (location_data.get('latitude') is not None and
+                    location_data.get('longitude') is not None):
+                    # Update the last selected location for future copying
+                    self._last_selected_location = location_data
+                    self.save_location_immediately(location_data)
+                else:
+                    # Text-only location - try to geocode it for coordinates
+                    location_text = self.previous_photo_metadata['location']
+                    self._attempt_geocode_for_copy(location_text)
             else:
-                # For text-only location (no coordinates), save as text in GPS ProcessingMethod field
+                # No location data - try to geocode the text
                 location_text = self.previous_photo_metadata['location']
-                location_data = {'address': location_text}
-                # Clear any previous coordinate data since this is text-only
-                self._last_selected_location = None
-                self.save_location_immediately(location_data)
+                self._attempt_geocode_for_copy(location_text)
 
         # Show success feedback
         self.autosave_label.configure(text="✓ Metadata copied from previous photo", text_color="green")
         self.root.after(3000, lambda: self.autosave_label.configure(
             text="Changes are saved automatically", text_color="gray"))
         self.update_status("Metadata copied from previous photo")
+
+    def _attempt_geocode_for_copy(self, location_text):
+        """Attempt to geocode a text location when copying from previous photo."""
+        if not self.geocoder:
+            # No geocoder available - inform user
+            self.autosave_label.configure(
+                text="⚠️ Location copied as text only (no GPS coordinates)",
+                text_color="orange"
+            )
+            self.root.after(5000, lambda: self.autosave_label.configure(
+                text="Changes are saved automatically", text_color="gray"))
+            return
+
+        def geocode_for_copy():
+            """Background geocoding for copy operation."""
+            try:
+                # Try to geocode the location text
+                locations = self.geocoder.geocode(location_text, exactly_one=False, limit=1, timeout=5)
+                if locations and len(locations) > 0:
+                    location = locations[0]
+                    location_data = {
+                        'address': location.address,
+                        'latitude': location.latitude,
+                        'longitude': location.longitude
+                    }
+                    # Schedule the save in the main thread
+                    self.root.after(0, lambda: self._save_geocoded_location(location_data))
+                else:
+                    # No results found
+                    self.root.after(0, lambda: self._handle_geocode_failure(location_text))
+            except Exception as e:
+                # Geocoding failed
+                self.root.after(0, lambda: self._handle_geocode_failure(location_text, str(e)))
+
+        # Run geocoding in background thread
+        threading.Thread(target=geocode_for_copy, daemon=True).start()
+
+    def _save_geocoded_location(self, location_data):
+        """Save successfully geocoded location data."""
+        self._last_selected_location = location_data
+        self.save_location_immediately(location_data)
+        self.autosave_label.configure(
+            text="✓ Location geocoded and saved with GPS coordinates",
+            text_color="green"
+        )
+        self.root.after(3000, lambda: self.autosave_label.configure(
+            text="Changes are saved automatically", text_color="gray"))
+
+    def _handle_geocode_failure(self, location_text, error=None):
+        """Handle geocoding failure when copying location."""
+        # Clear any previous coordinate data
+        self._last_selected_location = None
+
+        if error:
+            message = f"⚠️ Could not find GPS coordinates for '{location_text}' ({error})"
+        else:
+            message = f"⚠️ Could not find GPS coordinates for '{location_text}'"
+
+        self.autosave_label.configure(text=message, text_color="orange")
+        self.root.after(5000, lambda: self.autosave_label.configure(
+            text="Changes are saved automatically", text_color="gray"))
+
+        # Note: We don't save text-only locations as they won't work properly in Apple Photos
 
     def on_date_change(self, event=None):
         """Handle date field changes with real-time preview."""
@@ -1710,14 +1774,15 @@ The application creates backup files (.backup) before modifying originals."""
         self.update_date_field_display()
 
     def save_location_to_exif(self, exif_dict, location_data):
-        """Save location to EXIF GPS data or as text."""
+        """Save location to EXIF GPS data with coordinates."""
         if location_data is None:
             # Remove GPS data completely
             if "GPS" in exif_dict:
                 del exif_dict["GPS"]
         else:
-            # Check if we have coordinates
-            if 'latitude' in location_data and 'longitude' in location_data and location_data['latitude'] is not None and location_data['longitude'] is not None:
+            # Only save locations with valid coordinates (Apple Photos compatible)
+            if ('latitude' in location_data and 'longitude' in location_data and
+                location_data['latitude'] is not None and location_data['longitude'] is not None):
                 # Save GPS coordinates
                 # Ensure GPS dictionary exists
                 if "GPS" not in exif_dict:
@@ -1735,16 +1800,7 @@ The application creates backup files (.backup) before modifying originals."""
                 exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = 'N' if lat >= 0 else 'S'
                 exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = [(lon_deg, 1), (lon_min, 1), (int(lon_sec * 1000), 1000)]
                 exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = 'E' if lon >= 0 else 'W'
-            else:
-                # Save as text-only location in GPS ProcessingMethod field
-                if 'address' in location_data:
-                    # Ensure GPS dictionary exists
-                    if "GPS" not in exif_dict:
-                        exif_dict["GPS"] = {}
-
-                    # Save location text in GPS ProcessingMethod field
-                    location_text = location_data['address']
-                    exif_dict["GPS"][piexif.GPSIFD.GPSProcessingMethod] = location_text.encode('utf-8')
+            # Note: Text-only locations are no longer saved as they don't work properly in Apple Photos
 
     def decimal_to_gps(self, decimal_coord):
         """Convert decimal coordinate to GPS degrees, minutes, seconds."""
