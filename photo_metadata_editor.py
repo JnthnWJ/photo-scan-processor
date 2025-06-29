@@ -949,6 +949,13 @@ The application creates backup files (.backup) before modifying originals."""
                     'latitude': self._last_selected_location.get('latitude'),
                     'longitude': self._last_selected_location.get('longitude')
                 }
+            else:
+                # For text-only locations, create location_data without coordinates
+                current_metadata['location_data'] = {
+                    'address': location_text,
+                    'latitude': None,
+                    'longitude': None
+                }
 
         # Store the metadata
         self.previous_photo_metadata = current_metadata
