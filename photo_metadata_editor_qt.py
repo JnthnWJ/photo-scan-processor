@@ -12,11 +12,11 @@ import threading
 import time
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent
 from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage
 
 from PIL import Image
@@ -242,13 +242,16 @@ class PhotoMetadataEditor(QMainWindow):
         self.date_entry = QLineEdit()
         self.date_entry.setPlaceholderText("Enter date (e.g., '2001', 'jan 1 2001', '5/11/01')")
         self.date_entry.textChanged.connect(self.on_date_change)
+        # Install event filter to handle Tab, Enter, and focus events
+        self.date_entry.installEventFilter(self)
         date_layout.addWidget(self.date_entry)
-        
-        # Date preview label
-        self.date_preview_label = QLabel()
-        self.date_preview_label.setStyleSheet("QLabel { font-size: 10px; color: blue; }")
-        self.date_preview_label.hide()
-        date_layout.addWidget(self.date_preview_label)
+
+        # Date suggestions frame (initially hidden)
+        self.date_suggestions_frame = QFrame()
+        self.date_suggestions_layout = QVBoxLayout(self.date_suggestions_frame)
+        self.date_suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        self.date_suggestions_frame.hide()
+        date_layout.addWidget(self.date_suggestions_frame)
         
         # Date hint
         date_hint = QLabel("Natural language dates supported (e.g., 'jan 1 2001', '5/11/01')")
@@ -927,19 +930,128 @@ The application creates backup files (.backup) before modifying originals."""
         self.show_date_preview(date_text)
 
     def show_date_preview(self, date_text):
-        """Show preview of parsed date."""
-        try:
-            parsed_date = date_parser.parse(date_text, fuzzy=True)
-            preview_text = f"Preview: {parsed_date.strftime('%B %d, %Y')}"
-            self.date_preview_label.setText(preview_text)
-            self.date_preview_label.show()
-        except Exception:
-            self.date_preview_label.setText("Invalid date format")
-            self.date_preview_label.show()
+        """Show date preview dropdown."""
+        # Parse date
+        parsed_date = self.parse_natural_date(date_text)
+
+        # Clear existing suggestions
+        self.clear_date_suggestions()
+
+        if not parsed_date:
+            self.hide_date_preview()
+            return
+
+        # Show suggestions frame
+        self.date_suggestions_frame.show()
+
+        # Create preview button (styled to match location suggestions)
+        preview_text = parsed_date.strftime('%B %d, %Y')
+        suggestion_btn = QPushButton(f"📅 {preview_text}")
+        suggestion_btn.clicked.connect(lambda: self.select_date_suggestion(parsed_date))
+        # Apply consistent styling with location suggestions
+        suggestion_btn.setMinimumHeight(30)
+        self.date_suggestions_layout.addWidget(suggestion_btn)
 
     def hide_date_preview(self):
-        """Hide date preview."""
-        self.date_preview_label.hide()
+        """Hide date preview dropdown."""
+        self.date_suggestions_frame.hide()
+        self.clear_date_suggestions()
+
+    def clear_date_suggestions(self):
+        """Clear all date suggestion widgets."""
+        while self.date_suggestions_layout.count():
+            child = self.date_suggestions_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def select_date_suggestion(self, parsed_date):
+        """Select a date suggestion."""
+        self.apply_date_confirmation(parsed_date)
+
+    def eventFilter(self, obj, event):
+        """Handle events for date input field."""
+        if obj == self.date_entry:
+            if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+                    self.on_date_enter_key()
+                    return True
+                elif event.key() == Qt.Key_Tab:
+                    self.on_date_tab_key()
+                    # Let Tab continue to next widget
+                    return False
+            elif event.type() == QEvent.FocusOut:
+                self.on_date_focus_out()
+        return super().eventFilter(obj, event)
+
+    def on_date_enter_key(self):
+        """Handle Enter key press in date field."""
+        date_text = self.date_entry.text().strip()
+        if date_text:
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                self.apply_date_confirmation(parsed_date)
+                # Move focus to next field (caption)
+                self.caption_text.setFocus()
+
+    def on_date_tab_key(self):
+        """Handle Tab key press in date field."""
+        date_text = self.date_entry.text().strip()
+        if date_text:
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                self.apply_date_confirmation(parsed_date)
+
+    def on_date_focus_out(self):
+        """Handle date field losing focus."""
+        date_text = self.date_entry.text().strip()
+        if date_text:
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                self.apply_date_confirmation(parsed_date)
+        # Small delay to allow click on preview button
+        QTimer.singleShot(100, self.hide_date_preview)
+
+    def apply_date_confirmation(self, parsed_date):
+        """Apply confirmed date to field and save immediately."""
+        if parsed_date:
+            # Update entry field with formatted date
+            formatted_date = parsed_date.strftime("%B %d, %Y")
+            self.date_entry.setText(formatted_date)
+            # Hide preview
+            self.hide_date_preview()
+            # Save the date immediately
+            self.save_date_immediately(parsed_date)
+
+    def parse_natural_date(self, date_text):
+        """Parse natural language date input."""
+        try:
+            # Handle year-only input
+            if date_text.isdigit() and len(date_text) == 4:
+                year = int(date_text)
+                if 1900 <= year <= 2100:
+                    return datetime(year, 1, 1)
+
+            # Use dateutil parser for flexible parsing
+            parsed_date = date_parser.parse(date_text, fuzzy=True)
+
+            # Validate reasonable date range
+            if 1900 <= parsed_date.year <= 2100:
+                return parsed_date
+            else:
+                return None
+        except Exception:
+            return None
+
+    def save_date_immediately(self, parsed_date):
+        """Save date immediately without auto-formatting during typing."""
+        if not self.photo_files:
+            return
+
+        # Store the date change
+        self.pending_changes['date'] = parsed_date
+
+        # Save immediately without triggering the timer
+        self.save_pending_metadata()
 
     def on_caption_change(self):
         """Handle caption field changes."""
@@ -1041,9 +1153,9 @@ The application creates backup files (.backup) before modifying originals."""
             self.update_status(f"Error saving metadata: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to save metadata: {str(e)}")
 
-    def save_date_to_exif(self, exif_dict, date_text):
+    def save_date_to_exif(self, exif_dict, date_value):
         """Save date to EXIF data."""
-        if date_text is None:
+        if date_value is None:
             # Remove date fields
             if "Exif" in exif_dict and piexif.ExifIFD.DateTimeOriginal in exif_dict["Exif"]:
                 del exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal]
@@ -1051,8 +1163,12 @@ The application creates backup files (.backup) before modifying originals."""
                 del exif_dict["0th"][piexif.ImageIFD.DateTime]
         else:
             try:
-                # Parse the date
-                parsed_date = date_parser.parse(date_text, fuzzy=True)
+                # Handle both string and datetime objects
+                if isinstance(date_value, datetime):
+                    parsed_date = date_value
+                else:
+                    # Parse the date string
+                    parsed_date = date_parser.parse(date_value, fuzzy=True)
                 exif_date_str = parsed_date.strftime("%Y:%m:%d %H:%M:%S")
 
                 # Set in both DateTimeOriginal and DateTime
@@ -1286,6 +1402,7 @@ The application creates backup files (.backup) before modifying originals."""
     def hide_all_suggestions(self):
         """Hide all suggestion dropdowns."""
         self.hide_location_suggestions()
+        self.hide_date_preview()
 
     def update_status(self, message: str):
         """Update the status bar."""
