@@ -14,10 +14,11 @@ import time
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame,
-    QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter
+    QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent
-from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent, QRectF
+from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage, QWheelEvent, QPainter
 
 from PIL import Image
 import piexif
@@ -25,6 +26,163 @@ from datetime import datetime
 from dateutil import parser as date_parser
 from geopy.geocoders import Nominatim
 import requests
+
+
+class ZoomableImageViewer(QGraphicsView):
+    """A zoomable and pannable image viewer widget."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Create graphics scene
+        self.scene = QGraphicsScene()
+        self.setScene(self.scene)
+
+        # Image item
+        self.image_item = None
+
+        # Zoom settings
+        self.zoom_factor = 1.0
+        self.min_zoom = 0.1
+        self.max_zoom = 10.0
+        self.zoom_step = 1.2
+
+        # Configure view
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setFrameStyle(QFrame.NoFrame)
+
+        # Enable mouse tracking for panning
+        self.setMouseTracking(True)
+
+        # Initial state
+        self.has_image = False
+        self.fit_to_window_on_load = True
+
+    def set_image(self, pixmap: QPixmap):
+        """Set the image to display."""
+        # Clear existing image
+        if self.image_item:
+            self.scene.removeItem(self.image_item)
+
+        # Add new image
+        self.image_item = QGraphicsPixmapItem(pixmap)
+        self.scene.addItem(self.image_item)
+
+        # Update scene rect to match image
+        self.scene.setSceneRect(self.image_item.boundingRect())
+
+        # Fit to window by default
+        if self.fit_to_window_on_load:
+            self.fit_to_window()
+
+        self.has_image = True
+
+    def fit_to_window(self):
+        """Fit the image to the window size."""
+        if not self.image_item:
+            return
+
+        # Get the view's viewport size
+        view_rect = self.viewport().rect()
+
+        # Get the image's bounding rect
+        image_rect = self.image_item.boundingRect()
+
+        if image_rect.isEmpty() or view_rect.isEmpty():
+            return
+
+        # Calculate scale to fit image in view
+        scale_x = view_rect.width() / image_rect.width()
+        scale_y = view_rect.height() / image_rect.height()
+        scale = min(scale_x, scale_y)
+
+        # Apply the scale
+        self.resetTransform()
+        self.scale(scale, scale)
+        self.zoom_factor = scale
+
+        # Center the image
+        self.centerOn(self.image_item)
+
+    def wheelEvent(self, event: QWheelEvent):
+        """Handle mouse wheel events for zooming."""
+        if not self.has_image:
+            return
+
+        # Get the position of the mouse in scene coordinates
+        scene_pos = self.mapToScene(event.position().toPoint())
+
+        # Calculate zoom
+        if event.angleDelta().y() > 0:
+            zoom_in = True
+            factor = self.zoom_step
+        else:
+            zoom_in = False
+            factor = 1.0 / self.zoom_step
+
+        # Check zoom limits
+        new_zoom = self.zoom_factor * factor
+        if new_zoom < self.min_zoom or new_zoom > self.max_zoom:
+            return
+
+        # Apply zoom
+        self.scale(factor, factor)
+        self.zoom_factor = new_zoom
+
+        # Keep the mouse position fixed during zoom
+        new_scene_pos = self.mapToScene(event.position().toPoint())
+        delta = new_scene_pos - scene_pos
+        self.translate(delta.x(), delta.y())
+
+    def mousePressEvent(self, event):
+        """Handle mouse press events."""
+        if event.button() == Qt.MiddleButton:
+            # Middle click to fit to window
+            self.fit_to_window()
+        elif event.button() == Qt.LeftButton and self.has_image:
+            # Left click to pan
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release events."""
+        if event.button() == Qt.LeftButton:
+            self.setDragMode(QGraphicsView.RubberBandDrag)
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        """Handle resize events."""
+        super().resizeEvent(event)
+        if self.has_image and self.fit_to_window_on_load:
+            # Re-fit to window when resized
+            QTimer.singleShot(100, self.fit_to_window)
+
+    def reset_zoom(self):
+        """Reset zoom to fit window."""
+        self.fit_to_window()
+
+    def zoom_in(self):
+        """Zoom in."""
+        if not self.has_image:
+            return
+        factor = self.zoom_step
+        new_zoom = self.zoom_factor * factor
+        if new_zoom <= self.max_zoom:
+            self.scale(factor, factor)
+            self.zoom_factor = new_zoom
+
+    def zoom_out(self):
+        """Zoom out."""
+        if not self.has_image:
+            return
+        factor = 1.0 / self.zoom_step
+        new_zoom = self.zoom_factor * factor
+        if new_zoom >= self.min_zoom:
+            self.scale(factor, factor)
+            self.zoom_factor = new_zoom
 
 
 class PhotoMetadataEditor(QMainWindow):
@@ -119,6 +277,9 @@ class PhotoMetadataEditor(QMainWindow):
         
         # Create status bar
         self.create_status_bar()
+
+        # Show placeholder initially
+        self.show_placeholder()
         
     def create_toolbar(self):
         """Create the top toolbar."""
@@ -150,19 +311,24 @@ class PhotoMetadataEditor(QMainWindow):
         self.photo_frame = QFrame()
         self.photo_frame.setFrameStyle(QFrame.StyledPanel)
         parent.addWidget(self.photo_frame)
-        
+
         # Layout for photo viewer
         photo_layout = QVBoxLayout(self.photo_frame)
-        
-        # Photo display label
-        self.photo_label = QLabel("Select a folder to view photos")
-        self.photo_label.setAlignment(Qt.AlignCenter)
-        self.photo_label.setStyleSheet("QLabel { font-size: 16px; }")
-        self.photo_label.setMinimumSize(400, 300)
-        photo_layout.addWidget(self.photo_label)
-        
+
+        # Photo display viewer (zoomable)
+        self.photo_viewer = ZoomableImageViewer()
+        self.photo_viewer.setMinimumSize(400, 300)
+        photo_layout.addWidget(self.photo_viewer)
+
+        # Placeholder label for when no image is loaded
+        self.placeholder_label = QLabel("Select a folder to view photos")
+        self.placeholder_label.setAlignment(Qt.AlignCenter)
+        self.placeholder_label.setStyleSheet("QLabel { font-size: 16px; }")
+        self.placeholder_label.hide()  # Initially hidden, will show when needed
+        photo_layout.addWidget(self.placeholder_label)
+
         # Navigation info
-        self.nav_info_label = QLabel("Use ← → arrow keys to navigate")
+        self.nav_info_label = QLabel("Use ← → arrow keys to navigate | Mouse wheel to zoom | Middle click to fit")
         self.nav_info_label.setAlignment(Qt.AlignCenter)
         self.nav_info_label.setStyleSheet("QLabel { font-size: 12px; color: gray; }")
         photo_layout.addWidget(self.nav_info_label)
@@ -623,37 +789,34 @@ The application creates backup files (.backup) before modifying originals."""
             QMessageBox.critical(self, "Error", f"Failed to load photo {os.path.basename(photo_path)}: {str(e)}")
 
     def display_scaled_image(self):
-        """Scale and display the current image using caching."""
+        """Display the current image in the zoomable viewer."""
         if not self.current_image or not self.photo_files:
             return
 
-        # Get viewer dimensions
-        viewer_size = self.photo_label.size()
-        viewer_width = viewer_size.width()
-        viewer_height = viewer_size.height()
-
-        if viewer_width <= 1 or viewer_height <= 1:
-            # Window not yet properly sized, try again later
-            QTimer.singleShot(100, self.display_scaled_image)
-            return
-
-        # Calculate scaling to fit within viewer
+        # Get the original image size
         img_width, img_height = self.current_image.size
-        scale_x = (viewer_width - 40) / img_width
-        scale_y = (viewer_height - 80) / img_height  # Leave space for navigation info
-        scale = min(scale_x, scale_y, 1.0)  # Don't scale up
 
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
-        target_size = (new_width, new_height)
-
-        # Get scaled image from cache
+        # Create a QPixmap from the original image (no pre-scaling needed)
         photo_path = self.photo_files[self.current_photo_index]
-        scaled_pixmap = self._get_cached_scaled_pixmap(photo_path, target_size)
 
-        # Update label
-        self.photo_label.setPixmap(scaled_pixmap)
-        self.photo_label.setText("")  # Clear text when showing image
+        # Use the original image size for the pixmap to maintain quality
+        original_pixmap = self._get_cached_scaled_pixmap(photo_path, (img_width, img_height))
+
+        # Set the image in the viewer (it will handle scaling automatically)
+        self.photo_viewer.set_image(original_pixmap)
+
+        # Hide placeholder and show viewer
+        self.placeholder_label.hide()
+        self.photo_viewer.show()
+
+    def show_placeholder(self, message="Select a folder to view photos"):
+        """Show placeholder message when no image is loaded."""
+        self.placeholder_label.setText(message)
+        self.placeholder_label.show()
+        # Clear the image viewer
+        if hasattr(self, 'photo_viewer'):
+            self.photo_viewer.scene.clear()
+            self.photo_viewer.has_image = False
 
     def _preload_adjacent_images(self):
         """Preload adjacent images in background for smooth navigation."""
@@ -1468,9 +1631,8 @@ The application creates backup files (.backup) before modifying originals."""
     def resizeEvent(self, event):
         """Handle window resize events."""
         super().resizeEvent(event)
-        # Redisplay image with new size after a short delay
-        if hasattr(self, 'current_image') and self.current_image:
-            QTimer.singleShot(100, self.display_scaled_image)
+        # The ZoomableImageViewer handles its own resize events
+        # No need to manually trigger image redisplay
 
     def closeEvent(self, event):
         """Handle application close event."""
