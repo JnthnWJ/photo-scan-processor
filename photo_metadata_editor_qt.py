@@ -978,17 +978,27 @@ The application creates backup files (.backup) before modifying originals."""
 
         # Copy date
         if 'date' in self.previous_photo_metadata:
-            self.date_entry.setText(self.previous_photo_metadata['date'])
+            date_text = self.previous_photo_metadata['date']
+            self.date_entry.setText(date_text)
+            # Parse and save the date immediately (like manual confirmation)
+            parsed_date = self.parse_natural_date(date_text)
+            if parsed_date:
+                self.apply_date_confirmation(parsed_date)
 
         # Copy caption
         if 'caption' in self.previous_photo_metadata:
-            self.caption_text.setPlainText(self.previous_photo_metadata['caption'])
+            caption_text = self.previous_photo_metadata['caption']
+            self.caption_text.setPlainText(caption_text)
+            # Save caption immediately
+            self.schedule_metadata_save('caption', caption_text)
 
         # Copy location
         if 'location' in self.previous_photo_metadata:
             location_data = self.previous_photo_metadata['location']
             self.location_entry.setText(location_data['address'])
+            # Save location immediately (like manual selection)
             self._last_selected_location = location_data
+            self.schedule_metadata_save('location', location_data)
 
         self.update_status("Metadata copied from previous photo")
 
