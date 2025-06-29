@@ -106,6 +106,10 @@ class PhotoMetadataEditor:
         # Load image and add to cache
         try:
             image = Image.open(photo_path)
+
+            # Apply EXIF orientation correction
+            image = self._apply_exif_orientation(image, photo_path)
+
             # Convert to RGB if necessary (for JPEG compatibility)
             if image.mode not in ('RGB', 'L'):
                 image = image.convert('RGB')
@@ -117,6 +121,46 @@ class PhotoMetadataEditor:
             return image
         except Exception as e:
             raise e
+
+    def _apply_exif_orientation(self, image, photo_path):
+        """Apply EXIF orientation correction to the image."""
+        try:
+            # Load EXIF data to check orientation
+            exif_dict = piexif.load(photo_path)
+
+            # Check for orientation tag in EXIF
+            if "0th" in exif_dict and piexif.ImageIFD.Orientation in exif_dict["0th"]:
+                orientation = exif_dict["0th"][piexif.ImageIFD.Orientation]
+
+                # Apply rotation based on EXIF orientation
+                if orientation == 2:
+                    # Horizontal flip
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                elif orientation == 3:
+                    # 180 degree rotation
+                    image = image.transpose(Image.ROT_180)
+                elif orientation == 4:
+                    # Vertical flip
+                    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                elif orientation == 5:
+                    # Horizontal flip + 90 degree rotation
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_90)
+                elif orientation == 6:
+                    # 90 degree rotation
+                    image = image.transpose(Image.ROT_270)
+                elif orientation == 7:
+                    # Horizontal flip + 270 degree rotation
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_270)
+                elif orientation == 8:
+                    # 270 degree rotation
+                    image = image.transpose(Image.ROT_90)
+                # orientation == 1 means no rotation needed (normal)
+
+        except Exception as e:
+            # If EXIF reading fails, just return the original image
+            print(f"Warning: Could not read EXIF orientation for {photo_path}: {e}")
+
+        return image
 
     def _get_cached_scaled_image(self, photo_path, target_size):
         """Get scaled image from cache or create and cache it."""

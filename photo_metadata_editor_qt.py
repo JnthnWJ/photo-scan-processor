@@ -474,6 +474,10 @@ The application creates backup files (.backup) before modifying originals."""
         # Load image and add to cache
         try:
             image = Image.open(photo_path)
+
+            # Apply EXIF orientation correction
+            image = self._apply_exif_orientation(image, photo_path)
+
             # Convert to RGB if necessary (for JPEG compatibility)
             if image.mode not in ('RGB', 'L'):
                 image = image.convert('RGB')
@@ -485,6 +489,46 @@ The application creates backup files (.backup) before modifying originals."""
             return image
         except Exception as e:
             raise e
+
+    def _apply_exif_orientation(self, image, photo_path):
+        """Apply EXIF orientation correction to the image."""
+        try:
+            # Load EXIF data to check orientation
+            exif_dict = piexif.load(photo_path)
+
+            # Check for orientation tag in EXIF
+            if "0th" in exif_dict and piexif.ImageIFD.Orientation in exif_dict["0th"]:
+                orientation = exif_dict["0th"][piexif.ImageIFD.Orientation]
+
+                # Apply rotation based on EXIF orientation
+                if orientation == 2:
+                    # Horizontal flip
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                elif orientation == 3:
+                    # 180 degree rotation
+                    image = image.transpose(Image.ROT_180)
+                elif orientation == 4:
+                    # Vertical flip
+                    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                elif orientation == 5:
+                    # Horizontal flip + 90 degree rotation
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_90)
+                elif orientation == 6:
+                    # 90 degree rotation
+                    image = image.transpose(Image.ROT_270)
+                elif orientation == 7:
+                    # Horizontal flip + 270 degree rotation
+                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_270)
+                elif orientation == 8:
+                    # 270 degree rotation
+                    image = image.transpose(Image.ROT_90)
+                # orientation == 1 means no rotation needed (normal)
+
+        except Exception as e:
+            # If EXIF reading fails, just return the original image
+            print(f"Warning: Could not read EXIF orientation for {photo_path}: {e}")
+
+        return image
 
     def _get_cached_scaled_pixmap(self, photo_path, target_size):
         """Get scaled QPixmap from cache or create and cache it."""
@@ -502,26 +546,39 @@ The application creates backup files (.backup) before modifying originals."""
         # Create scaled version
         resized_image = original_image.resize(target_size, Image.Resampling.LANCZOS)
 
-        # Convert PIL image to QPixmap
-        if resized_image.mode == 'RGB':
-            # Convert RGB to QPixmap
-            rgb_image = resized_image.tobytes('raw', 'RGB')
-            qimage = QPixmap.fromImage(
-                QImage(rgb_image, resized_image.width, resized_image.height, QImage.Format_RGB888)
-            )
-        else:
-            # For other modes, convert to RGB first
-            rgb_image = resized_image.convert('RGB')
-            rgb_data = rgb_image.tobytes('raw', 'RGB')
-            qimage = QPixmap.fromImage(
-                QImage(rgb_data, rgb_image.width, rgb_image.height, QImage.Format_RGB888)
-            )
+        # Convert PIL image to QPixmap with proper handling
+        try:
+            qimage = self._pil_to_qpixmap(resized_image)
+        except Exception as e:
+            print(f"Error converting image to QPixmap: {e}")
+            # Fallback: create a placeholder image
+            qimage = QPixmap(target_size[0], target_size[1])
+            qimage.fill(Qt.gray)
 
         # Add to cache
         self.scaled_cache[cache_key] = qimage
         self._manage_scaled_cache()
 
         return qimage
+
+    def _pil_to_qpixmap(self, pil_image):
+        """Convert PIL image to QPixmap with proper format handling."""
+        # Ensure image is in RGB mode
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+
+        # Get image data
+        width, height = pil_image.size
+        rgb_data = pil_image.tobytes('raw', 'RGB')
+
+        # Calculate bytes per line (stride) - important for proper display
+        bytes_per_line = width * 3  # 3 bytes per pixel for RGB
+
+        # Create QImage with proper stride
+        qimage = QImage(rgb_data, width, height, bytes_per_line, QImage.Format_RGB888)
+
+        # Convert to QPixmap
+        return QPixmap.fromImage(qimage)
 
     def _manage_scaled_cache(self):
         """Manage scaled image cache size."""
