@@ -999,14 +999,19 @@ The application creates backup files (.backup) before modifying originals."""
             self.location_entry.delete(0, 'end')
             self.location_entry.insert(0, self.previous_photo_metadata['location'])
 
-            # Use location data with coordinates if available, otherwise just save as text
+            # Use location data with coordinates if available, otherwise save as text-only
             if 'location_data' in self.previous_photo_metadata:
                 location_data = self.previous_photo_metadata['location_data']
-                self.schedule_metadata_save('location', location_data)
+                # Update the last selected location for future copying
+                self._last_selected_location = location_data
+                self.save_location_immediately(location_data)
             else:
-                # For text-only location (no coordinates), don't save to EXIF GPS fields
-                # Just keep the text in the UI field for user reference
-                pass
+                # For text-only location (no coordinates), save as text in GPS ProcessingMethod field
+                location_text = self.previous_photo_metadata['location']
+                location_data = {'address': location_text}
+                # Clear any previous coordinate data since this is text-only
+                self._last_selected_location = None
+                self.save_location_immediately(location_data)
 
         # Show success feedback
         self.autosave_label.configure(text="✓ Metadata copied from previous photo", text_color="green")
@@ -1291,6 +1296,17 @@ The application creates backup files (.backup) before modifying originals."""
 
         # Store the date change
         self.pending_changes['date'] = parsed_date
+
+        # Save immediately without triggering the timer
+        self.save_pending_metadata()
+
+    def save_location_immediately(self, location_data):
+        """Save location immediately without delay."""
+        if not self.photo_files:
+            return
+
+        # Store the location change
+        self.pending_changes['location'] = location_data
 
         # Save immediately without triggering the timer
         self.save_pending_metadata()
