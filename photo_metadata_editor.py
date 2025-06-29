@@ -185,6 +185,7 @@ class PhotoMetadataEditor:
         )
         self.date_entry.pack(fill="x", padx=15, pady=(0, 10))
         self.date_entry.bind("<KeyRelease>", self.on_date_change)
+        self.date_entry.bind("<Button-1>", lambda e: self.date_entry.focus_set())
 
         # Date format hint
         date_hint = ctk.CTkLabel(
@@ -206,6 +207,7 @@ class PhotoMetadataEditor:
         self.caption_text = ctk.CTkTextbox(caption_frame, height=100)
         self.caption_text.pack(fill="x", padx=15, pady=(0, 10))
         self.caption_text.bind("<KeyRelease>", self.on_caption_change)
+        self.caption_text.bind("<Button-1>", lambda e: self.caption_text.focus_set())
 
         # Caption hint
         caption_hint = ctk.CTkLabel(
@@ -231,6 +233,7 @@ class PhotoMetadataEditor:
         )
         self.location_entry.pack(fill="x", padx=15, pady=(0, 10))
         self.location_entry.bind("<KeyRelease>", self.on_location_change)
+        self.location_entry.bind("<Button-1>", lambda e: self.location_entry.focus_set())
 
         # Location suggestions frame
         self.location_suggestions_frame = ctk.CTkFrame(location_frame)
@@ -267,11 +270,35 @@ class PhotoMetadataEditor:
         self.root.bind("<Escape>", lambda e: self.hide_location_suggestions())  # Esc to hide suggestions
         self.root.focus_set()  # Ensure window can receive key events
 
-        # Make sure the window can receive focus for keyboard events
-        self.root.bind("<Button-1>", lambda e: self.root.focus_set())
+        # Make sure the window can receive focus for keyboard events, but only when clicking on non-input areas
+        self.root.bind("<Button-1>", self.handle_root_click)
 
         # Bind window close event
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def handle_root_click(self, event):
+        """Handle clicks on the root window, but allow input fields to receive focus."""
+        # Get the widget that was clicked
+        clicked_widget = event.widget
+
+        # Check if the clicked widget is an input field or its parent
+        widget_class_name = clicked_widget.__class__.__name__
+
+        # Don't steal focus from input widgets
+        if widget_class_name in ['CTkEntry', 'CTkTextbox']:
+            return
+
+        # Check if we clicked on a child of an input widget
+        parent = clicked_widget
+        while parent:
+            if hasattr(parent, '__class__'):
+                parent_class_name = parent.__class__.__name__
+                if parent_class_name in ['CTkEntry', 'CTkTextbox']:
+                    return
+            parent = getattr(parent, 'master', None)
+
+        # If we get here, it's safe to set focus to root for keyboard navigation
+        self.root.focus_set()
 
     def on_closing(self):
         """Handle window closing event."""
