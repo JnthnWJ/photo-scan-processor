@@ -42,8 +42,20 @@ class PhotoMetadataEditor:
         self.current_photo_ctk = None
         
         # Geocoder for location suggestions
-        self.geocoder = Nominatim(user_agent="photo_metadata_editor")
-        
+        print(f"[DEBUG] Initializing Nominatim geocoder...")
+        try:
+            self.geocoder = Nominatim(user_agent="photo_metadata_editor")
+            print(f"[DEBUG] Geocoder initialized successfully: {self.geocoder}")
+        except Exception as e:
+            print(f"[DEBUG] Failed to initialize geocoder: {e}")
+            self.geocoder = None
+
+        # Location suggestions state
+        self.location_suggestions = []
+        self.highlighted_suggestion_index = -1
+        self._pending_locations = None
+        self._geocoding_results_ready = False
+
         # Auto-save timer
         self.auto_save_timer = None
         self.pending_changes = {}
@@ -242,6 +254,11 @@ class PhotoMetadataEditor:
         self.location_entry.pack(fill="x", padx=15, pady=(0, 10))
         self.location_entry.bind("<KeyRelease>", self.on_location_change)
         self.location_entry.bind("<Button-1>", lambda e: self.location_entry.focus_set())
+        self.location_entry.bind("<Return>", self.on_location_enter_key)
+        self.location_entry.bind("<FocusOut>", self.on_location_focus_out)
+        self.location_entry.bind("<Tab>", self.on_location_tab_key)
+        self.location_entry.bind("<Up>", self.on_location_up_key)
+        self.location_entry.bind("<Down>", self.on_location_down_key)
 
         # Location suggestions frame
         self.location_suggestions_frame = ctk.CTkFrame(location_frame)
@@ -1012,54 +1029,158 @@ The application creates backup files (.backup) before modifying originals."""
         
     def on_location_change(self, event=None):
         """Handle location field changes."""
+        print(f"[DEBUG] on_location_change called")
         if not self.photo_files:
+            print(f"[DEBUG] No photo files loaded, returning")
             return
 
         location_text = self.location_entry.get().strip()
+        print(f"[DEBUG] Location text: '{location_text}'")
 
         if not location_text:
             # Clear location from EXIF if empty
+            print(f"[DEBUG] Empty location text, clearing")
             self.schedule_metadata_save('location', None)
             self.hide_location_suggestions()
             return
 
+        # Don't geocode very short text (less than 2 characters)
+        if len(location_text) < 2:
+            print(f"[DEBUG] Location text too short ({len(location_text)} chars), hiding suggestions")
+            self.hide_location_suggestions()
+            return
+
         # Schedule geocoding lookup
+        print(f"[DEBUG] Scheduling geocoding for: '{location_text}'")
         if hasattr(self, '_geocoding_timer'):
             self.root.after_cancel(self._geocoding_timer)
         self._geocoding_timer = self.root.after(500, lambda: self.geocode_location(location_text))
 
+        # Start polling for results if not already polling
+        if not hasattr(self, '_polling_active') or not self._polling_active:
+            self._start_result_polling()
+
     def geocode_location(self, location_text):
         """Geocode location text in background thread."""
+        print(f"[DEBUG] geocode_location called with: '{location_text}'")
+
+        # Show loading indicator
+        print(f"[DEBUG] Showing loading indicator")
+        self.show_location_loading()
+
         def geocode_worker():
+            print(f"[DEBUG] geocode_worker thread started")
             try:
+                print(f"[DEBUG] Calling geocoder.geocode with: '{location_text}'")
+                print(f"[DEBUG] Geocoder object: {self.geocoder}")
+
                 # Search for locations
                 locations = self.geocoder.geocode(location_text, exactly_one=False, limit=5, timeout=5)
+                print(f"[DEBUG] Geocoding completed. Results: {locations}")
+                print(f"[DEBUG] Number of results: {len(locations) if locations else 0}")
+
                 if locations:
-                    # Update UI in main thread
-                    self.root.after(0, lambda: self.show_location_suggestions(locations))
+                    print(f"[DEBUG] Setting geocoding results with {len(locations)} locations")
+                    # Store locations and set flag for polling-based approach
+                    self._pending_locations = list(locations)
+                    self._geocoding_results_ready = True
+                    print(f"[DEBUG] Results ready flag set to True")
                 else:
-                    self.root.after(0, self.hide_location_suggestions)
+                    print(f"[DEBUG] No results found, setting no results flag")
+                    self._pending_locations = []
+                    self._geocoding_results_ready = True
+
             except Exception as e:
-                self.root.after(0, lambda: self.update_status(f"Geocoding error: {str(e)}"))
+                print(f"[DEBUG] Exception in geocode_worker: {type(e).__name__}: {str(e)}")
+                import traceback
+                print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
+
+                # Handle different types of errors
+                import requests
+                error_msg = str(e)
+                if "timeout" in error_msg.lower():
+                    error_msg = "Request timed out. Check your internet connection."
+                elif isinstance(e, requests.exceptions.ConnectionError):
+                    error_msg = "No internet connection available."
+                elif "rate limit" in error_msg.lower():
+                    error_msg = "Too many requests. Please wait a moment."
+                else:
+                    error_msg = f"Geocoding service error: {error_msg}"
+
+                print(f"[DEBUG] Scheduling error message: {error_msg}")
+                # Use functools.partial for error message too
+                import functools
+                error_callback = functools.partial(self.show_location_error, str(error_msg))
+                self.root.after(0, error_callback)
+
+            print(f"[DEBUG] geocode_worker thread ending")
 
         # Run geocoding in background thread
+        print(f"[DEBUG] Starting geocoding thread")
         threading.Thread(target=geocode_worker, daemon=True).start()
+
+    def _start_result_polling(self):
+        """Start polling for geocoding results."""
+        print(f"[DEBUG] Starting result polling")
+        self._polling_active = True
+        self._polling_timer = self.root.after(100, self._check_geocoding_results)
+
+    def _check_geocoding_results(self):
+        """Check if geocoding results are ready and process them."""
+        if self._geocoding_results_ready:
+            print(f"[DEBUG] Geocoding results ready! Processing...")
+            self._geocoding_results_ready = False
+
+            if self._pending_locations:
+                print(f"[DEBUG] Processing {len(self._pending_locations)} locations")
+                locations = self._pending_locations
+                self._pending_locations = None
+                self.show_location_suggestions(locations)
+            else:
+                print(f"[DEBUG] No locations found, showing no results")
+                self.show_no_location_results()
+
+        # Always continue polling (don't stop after processing results)
+        self._polling_timer = self.root.after(100, self._check_geocoding_results)
+
+    def _handle_geocoding_results(self):
+        """Handle geocoding results in the main UI thread."""
+        print(f"[DEBUG] _handle_geocoding_results called!")
+        if hasattr(self, '_pending_locations') and self._pending_locations:
+            print(f"[DEBUG] Processing {len(self._pending_locations)} pending locations")
+            locations = self._pending_locations
+            self._pending_locations = None  # Clear the pending locations
+            self.show_location_suggestions(locations)
+        else:
+            print(f"[DEBUG] No pending locations found")
 
     def show_location_suggestions(self, locations):
         """Show location suggestions dropdown."""
+        print(f"[DEBUG] show_location_suggestions called with {len(locations) if locations else 0} locations")
+
+        # Store suggestions and reset highlighting
+        self.location_suggestions = locations[:5] if locations else []
+        self.highlighted_suggestion_index = 0 if self.location_suggestions else -1
+        print(f"[DEBUG] Stored {len(self.location_suggestions)} suggestions")
+
         # Clear existing suggestions
+        print(f"[DEBUG] Clearing existing suggestion widgets")
         for widget in self.location_suggestions_frame.winfo_children():
             widget.destroy()
 
         if not locations:
+            print(f"[DEBUG] No locations provided, hiding suggestions")
             self.hide_location_suggestions()
             return
 
         # Show suggestions frame
+        print(f"[DEBUG] Packing suggestions frame")
         self.location_suggestions_frame.pack(fill="x", padx=15, pady=(0, 10))
 
         # Add suggestion buttons
-        for i, location in enumerate(locations[:5]):  # Limit to 5 suggestions
+        print(f"[DEBUG] Creating suggestion buttons")
+        for i, location in enumerate(self.location_suggestions):
+            print(f"[DEBUG] Creating button {i}: {location.address}")
             suggestion_btn = ctk.CTkButton(
                 self.location_suggestions_frame,
                 text=location.address,
@@ -1068,9 +1189,97 @@ The application creates backup files (.backup) before modifying originals."""
             )
             suggestion_btn.pack(fill="x", pady=2)
 
+        # Apply initial highlighting
+        print(f"[DEBUG] Applying initial highlighting")
+        self.update_suggestion_highlighting()
+        print(f"[DEBUG] show_location_suggestions completed")
+
     def hide_location_suggestions(self):
         """Hide location suggestions dropdown."""
         self.location_suggestions_frame.pack_forget()
+        self.location_suggestions = []
+        self.highlighted_suggestion_index = -1
+
+    def update_suggestion_highlighting(self):
+        """Update visual highlighting of location suggestions."""
+        # Get all suggestion buttons
+        suggestion_buttons = [widget for widget in self.location_suggestions_frame.winfo_children()
+                            if isinstance(widget, ctk.CTkButton)]
+
+        # Update button appearance based on highlighting
+        for i, button in enumerate(suggestion_buttons):
+            if i == self.highlighted_suggestion_index:
+                # Highlight the selected suggestion
+                button.configure(fg_color=("gray75", "gray25"))
+            else:
+                # Reset to default appearance
+                button.configure(fg_color=("gray84", "gray25"))
+
+    def show_location_loading(self):
+        """Show loading indicator for location geocoding."""
+        print(f"[DEBUG] show_location_loading called")
+
+        # Clear existing suggestions
+        print(f"[DEBUG] Clearing existing widgets for loading")
+        for widget in self.location_suggestions_frame.winfo_children():
+            widget.destroy()
+
+        # Show suggestions frame with loading message
+        print(f"[DEBUG] Packing loading frame")
+        self.location_suggestions_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        print(f"[DEBUG] Creating loading label")
+        loading_label = ctk.CTkLabel(
+            self.location_suggestions_frame,
+            text="🔍 Searching for locations...",
+            height=30,
+            font=ctk.CTkFont(size=12)
+        )
+        loading_label.pack(fill="x", pady=2)
+        print(f"[DEBUG] Loading indicator displayed")
+
+    def show_no_location_results(self):
+        """Show message when no location results are found."""
+        # Clear existing suggestions
+        for widget in self.location_suggestions_frame.winfo_children():
+            widget.destroy()
+
+        # Show suggestions frame with no results message
+        self.location_suggestions_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        no_results_label = ctk.CTkLabel(
+            self.location_suggestions_frame,
+            text="❌ No locations found. Try a different search term.",
+            height=30,
+            font=ctk.CTkFont(size=12),
+            text_color="orange"
+        )
+        no_results_label.pack(fill="x", pady=2)
+
+        # Hide after 3 seconds
+        self.root.after(3000, self.hide_location_suggestions)
+
+    def show_location_error(self, error_message):
+        """Show error message for location geocoding."""
+        # Clear existing suggestions
+        for widget in self.location_suggestions_frame.winfo_children():
+            widget.destroy()
+
+        # Show suggestions frame with error message
+        self.location_suggestions_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        error_label = ctk.CTkLabel(
+            self.location_suggestions_frame,
+            text=f"⚠️ Error: {error_message}",
+            height=30,
+            font=ctk.CTkFont(size=12),
+            text_color="red"
+        )
+        error_label.pack(fill="x", pady=2)
+
+        # Hide after 5 seconds
+        self.root.after(5000, self.hide_location_suggestions)
+        self.update_status(f"Geocoding error: {error_message}")
 
     def select_location_suggestion(self, location):
         """Select a location suggestion."""
@@ -1124,7 +1333,56 @@ The application creates backup files (.backup) before modifying originals."""
         minutes = int(minutes_float)
         seconds = (minutes_float - minutes) * 60
         return degrees, minutes, seconds
-        
+
+    def on_location_enter_key(self, event=None):
+        """Handle Enter key press in location field."""
+        if self.highlighted_suggestion_index >= 0 and self.location_suggestions:
+            # Select the highlighted suggestion
+            location = self.location_suggestions[self.highlighted_suggestion_index]
+            self.select_location_suggestion(location)
+            # Move focus to next field (caption)
+            self.caption_text.focus_set()
+        else:
+            # If no suggestion is highlighted, try to geocode the current text
+            location_text = self.location_entry.get().strip()
+            if location_text:
+                self.geocode_location(location_text)
+        return "break"  # Prevent default Enter behavior
+
+    def on_location_focus_out(self, event=None):
+        """Handle location field losing focus."""
+        # Small delay to allow click on suggestion button
+        self.root.after(100, self.hide_location_suggestions)
+
+    def on_location_tab_key(self, event=None):
+        """Handle Tab key press in location field."""
+        if self.highlighted_suggestion_index >= 0 and self.location_suggestions:
+            # Select the highlighted suggestion
+            location = self.location_suggestions[self.highlighted_suggestion_index]
+            self.select_location_suggestion(location)
+        # Let default Tab behavior continue
+        return None
+
+    def on_location_up_key(self, event=None):
+        """Handle Up arrow key in location field."""
+        if self.location_suggestions:
+            if self.highlighted_suggestion_index > 0:
+                self.highlighted_suggestion_index -= 1
+            else:
+                self.highlighted_suggestion_index = len(self.location_suggestions) - 1
+            self.update_suggestion_highlighting()
+        return "break"  # Prevent cursor movement
+
+    def on_location_down_key(self, event=None):
+        """Handle Down arrow key in location field."""
+        if self.location_suggestions:
+            if self.highlighted_suggestion_index < len(self.location_suggestions) - 1:
+                self.highlighted_suggestion_index += 1
+            else:
+                self.highlighted_suggestion_index = 0
+            self.update_suggestion_highlighting()
+        return "break"  # Prevent cursor movement
+
     def update_status(self, message: str):
         """Update the status bar."""
         self.status_label.configure(text=message)
