@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent, QRectF
-from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage, QWheelEvent, QPainter
+from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage, QWheelEvent, QPainter, QTransform
 
 from PIL import Image
 import piexif
@@ -199,6 +199,9 @@ class PhotoMetadataEditor(QMainWindow):
         self.current_photo_index = 0
         self.current_image = None
         self.current_pixmap = None
+
+        # Manual rotation state (in 90-degree increments)
+        self.manual_rotation = 0  # 0, 90, 180, 270 degrees
         
         # Image caching system
         self.image_cache = OrderedDict()  # LRU cache for original images
@@ -322,6 +325,9 @@ class PhotoMetadataEditor(QMainWindow):
         # Layout for photo viewer
         photo_layout = QVBoxLayout(self.photo_frame)
 
+        # Create rotation toolbar
+        self.create_rotation_toolbar(photo_layout)
+
         # Photo display viewer (zoomable)
         self.photo_viewer = ZoomableImageViewer()
         self.photo_viewer.setMinimumSize(400, 300)
@@ -339,7 +345,42 @@ class PhotoMetadataEditor(QMainWindow):
         self.nav_info_label.setAlignment(Qt.AlignCenter)
         self.nav_info_label.setStyleSheet("QLabel { font-size: 12px; color: gray; }")
         photo_layout.addWidget(self.nav_info_label)
-        
+
+    def create_rotation_toolbar(self, parent_layout):
+        """Create the rotation toolbar above the image viewer."""
+        # Create horizontal layout for rotation controls
+        rotation_layout = QHBoxLayout()
+
+        # Add some spacing from the left
+        rotation_layout.addStretch()
+
+        # Rotate left button
+        self.rotate_left_btn = QPushButton("↺ Rotate Left")
+        self.rotate_left_btn.setToolTip("Rotate image 90° counter-clockwise")
+        self.rotate_left_btn.clicked.connect(self.rotate_left)
+        self.rotate_left_btn.setEnabled(False)  # Disabled until image is loaded
+        rotation_layout.addWidget(self.rotate_left_btn)
+
+        # Rotation indicator label
+        self.rotation_label = QLabel("0°")
+        self.rotation_label.setAlignment(Qt.AlignCenter)
+        self.rotation_label.setStyleSheet("QLabel { font-size: 12px; color: gray; margin: 0 10px; }")
+        self.rotation_label.setMinimumWidth(30)
+        rotation_layout.addWidget(self.rotation_label)
+
+        # Rotate right button
+        self.rotate_right_btn = QPushButton("↻ Rotate Right")
+        self.rotate_right_btn.setToolTip("Rotate image 90° clockwise")
+        self.rotate_right_btn.clicked.connect(self.rotate_right)
+        self.rotate_right_btn.setEnabled(False)  # Disabled until image is loaded
+        rotation_layout.addWidget(self.rotate_right_btn)
+
+        # Add some spacing to the right
+        rotation_layout.addStretch()
+
+        # Add the rotation layout to the parent
+        parent_layout.addLayout(rotation_layout)
+
     def create_metadata_panel(self, parent):
         """Create the metadata editing panel."""
         # Create metadata frame
@@ -692,25 +733,25 @@ The application creates backup files (.backup) before modifying originals."""
                 # Apply rotation based on EXIF orientation
                 if orientation == 2:
                     # Horizontal flip
-                    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                    image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
                 elif orientation == 3:
                     # 180 degree rotation
-                    image = image.transpose(Image.ROT_180)
+                    image = image.transpose(Image.Transpose.ROTATE_180)
                 elif orientation == 4:
                     # Vertical flip
-                    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                    image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
                 elif orientation == 5:
                     # Horizontal flip + 90 degree rotation
-                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_90)
+                    image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT).transpose(Image.Transpose.ROTATE_90)
                 elif orientation == 6:
                     # 90 degree rotation
-                    image = image.transpose(Image.ROT_270)
+                    image = image.transpose(Image.Transpose.ROTATE_270)
                 elif orientation == 7:
                     # Horizontal flip + 270 degree rotation
-                    image = image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.ROT_270)
+                    image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT).transpose(Image.Transpose.ROTATE_270)
                 elif orientation == 8:
                     # 270 degree rotation
-                    image = image.transpose(Image.ROT_90)
+                    image = image.transpose(Image.Transpose.ROTATE_90)
                 # orientation == 1 means no rotation needed (normal)
 
         except Exception as e:
@@ -786,6 +827,14 @@ The application creates backup files (.backup) before modifying originals."""
             # Load image from cache
             self.current_image = self._get_cached_image(photo_path)
 
+            # Reset manual rotation for new photo
+            self.manual_rotation = 0
+            self.rotation_label.setText("0°")
+
+            # Enable rotation buttons
+            self.rotate_left_btn.setEnabled(True)
+            self.rotate_right_btn.setEnabled(True)
+
             # Scale image to fit viewer
             self.display_scaled_image()
 
@@ -825,6 +874,15 @@ The application creates backup files (.backup) before modifying originals."""
         # Use the original image size for the pixmap to maintain quality
         original_pixmap = self._get_cached_scaled_pixmap(photo_path, (img_width, img_height))
 
+        # Apply manual rotation if needed
+        if self.manual_rotation != 0:
+            # Create a transformation matrix for rotation
+            transform = QTransform()
+            transform.rotate(self.manual_rotation)
+
+            # Apply the rotation to the pixmap
+            original_pixmap = original_pixmap.transformed(transform, Qt.SmoothTransformation)
+
         # Set the image in the viewer (it will handle scaling automatically)
         self.photo_viewer.set_image(original_pixmap)
 
@@ -840,6 +898,12 @@ The application creates backup files (.backup) before modifying originals."""
         if hasattr(self, 'photo_viewer'):
             self.photo_viewer.scene.clear()
             self.photo_viewer.has_image = False
+
+        # Disable rotation buttons when no image is loaded
+        if hasattr(self, 'rotate_left_btn'):
+            self.rotate_left_btn.setEnabled(False)
+            self.rotate_right_btn.setEnabled(False)
+            self.rotation_label.setText("0°")
 
     def _preload_adjacent_images(self):
         """Preload adjacent images in background for smooth navigation."""
@@ -942,12 +1006,19 @@ The application creates backup files (.backup) before modifying originals."""
             self.update_status("Already at last photo")
 
     def _save_pending_changes_before_navigation(self):
-        """Save any pending metadata changes before navigating to prevent data loss."""
+        """Save any pending metadata and rotation changes before navigating to prevent data loss."""
         if self.pending_changes:
             # Stop the auto-save timer to prevent race conditions
             self.auto_save_timer.stop()
             # Save immediately
             self.save_pending_metadata()
+
+        # Also save any pending rotation changes
+        if hasattr(self, 'rotation_save_timer') and self.rotation_save_timer.isActive():
+            # Stop the rotation save timer to prevent race conditions
+            self.rotation_save_timer.stop()
+            # Save rotation immediately
+            self.save_rotation_to_file()
 
     def store_current_photo_metadata(self):
         """Store current photo metadata for copying to next photo."""
@@ -1024,6 +1095,137 @@ The application creates backup files (.backup) before modifying originals."""
             self.schedule_metadata_save('location', location_data)
 
         self.update_status("Metadata copied from previous photo")
+
+    def rotate_left(self):
+        """Rotate the current image 90 degrees counter-clockwise."""
+        if not self.photo_files or not self.current_image:
+            return
+
+        # Update rotation state
+        self.manual_rotation = (self.manual_rotation - 90) % 360
+
+        # Update rotation label
+        self.rotation_label.setText(f"{self.manual_rotation}°")
+
+        # Refresh the image display
+        self.display_scaled_image()
+
+        # Schedule saving the rotated image
+        self.schedule_rotation_save()
+
+        self.update_status(f"Rotated image left to {self.manual_rotation}° - saving...")
+
+    def rotate_right(self):
+        """Rotate the current image 90 degrees clockwise."""
+        if not self.photo_files or not self.current_image:
+            return
+
+        # Update rotation state
+        self.manual_rotation = (self.manual_rotation + 90) % 360
+
+        # Update rotation label
+        self.rotation_label.setText(f"{self.manual_rotation}°")
+
+        # Refresh the image display
+        self.display_scaled_image()
+
+        # Schedule saving the rotated image
+        self.schedule_rotation_save()
+
+        self.update_status(f"Rotated image right to {self.manual_rotation}° - saving...")
+
+    def reset_rotation(self):
+        """Reset the image rotation to 0 degrees."""
+        if not self.photo_files or not self.current_image:
+            return
+
+        # Reset rotation state
+        self.manual_rotation = 0
+
+        # Update rotation label
+        self.rotation_label.setText("0°")
+
+        # Refresh the image display
+        self.display_scaled_image()
+
+        # Schedule saving the rotated image
+        self.schedule_rotation_save()
+
+        self.update_status("Reset image rotation - saving...")
+
+    def schedule_rotation_save(self):
+        """Schedule auto-save of rotation changes."""
+        # Stop existing rotation save timer if it exists
+        if hasattr(self, 'rotation_save_timer'):
+            self.rotation_save_timer.stop()
+        else:
+            self.rotation_save_timer = QTimer()
+            self.rotation_save_timer.setSingleShot(True)
+            self.rotation_save_timer.timeout.connect(self.save_rotation_to_file)
+
+        # Schedule save after 1 second delay (same as metadata)
+        self.rotation_save_timer.start(1000)
+
+    def save_rotation_to_file(self):
+        """Save the rotated image to the file permanently."""
+        if not self.photo_files or not self.current_image:
+            return
+
+        photo_path = self.photo_files[self.current_photo_index]
+
+        try:
+            # Create backup of original file
+            backup_path = photo_path + ".backup"
+            if not os.path.exists(backup_path):
+                import shutil
+                shutil.copy2(photo_path, backup_path)
+
+            # Apply rotation to the original image
+            rotated_image = self.current_image
+
+            # Apply rotation using PIL's transpose methods for better quality
+            if self.manual_rotation == 90:
+                rotated_image = rotated_image.transpose(Image.Transpose.ROTATE_270)  # ROTATE_270 = 90° clockwise
+            elif self.manual_rotation == 180:
+                rotated_image = rotated_image.transpose(Image.Transpose.ROTATE_180)
+            elif self.manual_rotation == 270:
+                rotated_image = rotated_image.transpose(Image.Transpose.ROTATE_90)   # ROTATE_90 = 270° clockwise
+            # 0 degrees = no rotation needed
+
+            # Save the rotated image back to the file
+            # Preserve original quality and format
+            save_kwargs = {}
+            if photo_path.lower().endswith('.jpg') or photo_path.lower().endswith('.jpeg'):
+                save_kwargs['quality'] = 95  # High quality for JPEG
+                save_kwargs['optimize'] = True
+
+            rotated_image.save(photo_path, **save_kwargs)
+
+            # Update the cached image with the rotated version
+            self.current_image = rotated_image
+            self.image_cache[photo_path] = rotated_image
+
+            # Clear scaled cache for this image so it gets regenerated
+            keys_to_remove = [key for key in self.scaled_cache.keys() if key.startswith(photo_path)]
+            for key in keys_to_remove:
+                del self.scaled_cache[key]
+
+            # Reset rotation state since it's now saved to the file
+            self.manual_rotation = 0
+            self.rotation_label.setText("0°")
+
+            # Refresh the display
+            self.display_scaled_image()
+
+            # Update status
+            self.update_status("✓ Image rotation saved permanently")
+
+            # Show temporary success message
+            QTimer.singleShot(3000, lambda: self.update_status("Ready"))
+
+        except Exception as e:
+            self.update_status(f"Error saving rotated image: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save rotated image: {str(e)}")
 
     def load_metadata(self):
         """Load metadata from the current photo."""
@@ -1904,10 +2106,16 @@ The application creates backup files (.backup) before modifying originals."""
             self._geocoding_timer.stop()
         if hasattr(self, '_polling_timer'):
             self._polling_timer.stop()
+        if hasattr(self, 'rotation_save_timer'):
+            self.rotation_save_timer.stop()
 
         # Save any pending changes
         if self.pending_changes:
             self.save_pending_metadata()
+
+        # Save any pending rotation changes
+        if hasattr(self, 'rotation_save_timer') and self.rotation_save_timer.isActive():
+            self.save_rotation_to_file()
 
         # Clean up image caches and free memory
         self._clear_image_caches()
