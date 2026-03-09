@@ -1,0 +1,14 @@
+# Python bytecode and cache directories
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS Finder and filesystem artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Icon?

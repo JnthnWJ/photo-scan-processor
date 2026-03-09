@@ -6,22 +6,29 @@ A desktop application for editing metadata of scanned photos with Apple Photos c
 
 import os
 import sys
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from collections import OrderedDict
 import threading
 import time
 import json
+import tempfile
+import shutil
+from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame,
+    QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame, QSlider,
+    QComboBox,
     QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent, QRectF
-from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage, QWheelEvent, QPainter, QTransform
+from PySide6.QtGui import (
+    QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage,
+    QWheelEvent, QPainter, QTransform, QColor, QPen, QCursor
+)
 
-from PIL import Image
+from PIL import Image, ImageEnhance
 import piexif
 from datetime import datetime
 from dateutil import parser as date_parser
@@ -29,8 +36,133 @@ from geopy.geocoders import Nominatim
 import requests
 
 
+@dataclass
+class PhotoEditState:
+    """Draft, non-destructive image edit state for a photo."""
+    brightness: int = 0
+    contrast: int = 0
+    saturation: int = 0
+    temperature: int = 0
+    tint: int = 0
+    crop_rect_norm: Optional[Tuple[float, float, float, float]] = None
+    crop_aspect: str = "freeform"
+    is_dirty: bool = False
+
+    def has_effective_changes(self) -> bool:
+        return any([
+            self.brightness != 0,
+            self.contrast != 0,
+            self.saturation != 0,
+            self.temperature != 0,
+            self.tint != 0,
+            self.crop_rect_norm is not None
+        ])
+
+
+@dataclass
+class CropTemplate:
+    """Session-level crop template reused for the next image."""
+    crop_rect_norm: Tuple[float, float, float, float]
+    crop_aspect: str
+
+
+def clamp_normalized_rect(rect_norm: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    """Clamp a normalized rectangle to valid bounds."""
+    left, top, right, bottom = rect_norm
+    left = max(0.0, min(1.0, left))
+    right = max(0.0, min(1.0, right))
+    top = max(0.0, min(1.0, top))
+    bottom = max(0.0, min(1.0, bottom))
+
+    if right <= left:
+        right = min(1.0, left + 0.01)
+    if bottom <= top:
+        bottom = min(1.0, top + 0.01)
+
+    return (left, top, right, bottom)
+
+
+def normalized_rect_to_pixel_box(
+    rect_norm: Tuple[float, float, float, float], width: int, height: int
+) -> Tuple[int, int, int, int]:
+    """Convert normalized rect to Pillow pixel crop box."""
+    left, top, right, bottom = clamp_normalized_rect(rect_norm)
+    px_left = int(round(left * width))
+    px_top = int(round(top * height))
+    px_right = int(round(right * width))
+    px_bottom = int(round(bottom * height))
+
+    px_left = max(0, min(width - 1, px_left))
+    px_top = max(0, min(height - 1, px_top))
+    px_right = max(px_left + 1, min(width, px_right))
+    px_bottom = max(px_top + 1, min(height, px_bottom))
+    return (px_left, px_top, px_right, px_bottom)
+
+
+def _apply_channel_gains(pil_image: Image.Image, r_gain: float, g_gain: float, b_gain: float) -> Image.Image:
+    """Apply per-channel gains with LUTs for high quality and speed."""
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+
+    r_gain = max(0.5, min(1.5, r_gain))
+    g_gain = max(0.5, min(1.5, g_gain))
+    b_gain = max(0.5, min(1.5, b_gain))
+
+    if abs(r_gain - 1.0) < 0.001 and abs(g_gain - 1.0) < 0.001 and abs(b_gain - 1.0) < 0.001:
+        return pil_image
+
+    lut_r = [max(0, min(255, int(i * r_gain))) for i in range(256)]
+    lut_g = [max(0, min(255, int(i * g_gain))) for i in range(256)]
+    lut_b = [max(0, min(255, int(i * b_gain))) for i in range(256)]
+    r_chan, g_chan, b_chan = pil_image.split()
+    return Image.merge("RGB", (r_chan.point(lut_r), g_chan.point(lut_g), b_chan.point(lut_b)))
+
+
+def apply_photo_adjustments(
+    source_image: Image.Image,
+    edit_state: PhotoEditState,
+    apply_crop: bool = True,
+    preview_max_dimension: Optional[int] = None
+) -> Image.Image:
+    """Build adjusted image from base image and non-destructive state."""
+    if source_image is None:
+        raise ValueError("source_image cannot be None")
+
+    working = source_image.copy()
+    if working.mode != "RGB":
+        working = working.convert("RGB")
+
+    if preview_max_dimension and max(working.size) > preview_max_dimension:
+        ratio = preview_max_dimension / float(max(working.size))
+        resized_size = (max(1, int(working.size[0] * ratio)), max(1, int(working.size[1] * ratio)))
+        working = working.resize(resized_size, Image.Resampling.LANCZOS)
+
+    # Adjustment order: brightness -> contrast -> saturation -> white balance -> tint -> crop
+    if edit_state.brightness != 0:
+        working = ImageEnhance.Brightness(working).enhance(max(0.0, 1.0 + (edit_state.brightness / 100.0)))
+    if edit_state.contrast != 0:
+        working = ImageEnhance.Contrast(working).enhance(max(0.0, 1.0 + (edit_state.contrast / 100.0)))
+    if edit_state.saturation != 0:
+        working = ImageEnhance.Color(working).enhance(max(0.0, 1.0 + (edit_state.saturation / 100.0)))
+
+    temperature = edit_state.temperature / 100.0
+    tint = edit_state.tint / 100.0
+    red_gain = 1.0 + (temperature * 0.25) - (tint * 0.05)
+    green_gain = 1.0 + (tint * 0.20)
+    blue_gain = 1.0 - (temperature * 0.25) - (tint * 0.05)
+    working = _apply_channel_gains(working, red_gain, green_gain, blue_gain)
+
+    if apply_crop and edit_state.crop_rect_norm:
+        crop_box = normalized_rect_to_pixel_box(edit_state.crop_rect_norm, working.width, working.height)
+        working = working.crop(crop_box)
+
+    return working
+
+
 class ZoomableImageViewer(QGraphicsView):
     """A zoomable and pannable image viewer widget."""
+    cropChanged = Signal(object)
+    cropModeChanged = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,6 +193,15 @@ class ZoomableImageViewer(QGraphicsView):
         # Initial state
         self.has_image = False
         self.fit_to_window_on_load = True
+        self.crop_mode_enabled = False
+        self.crop_rect_scene: Optional[QRectF] = None
+        self.crop_aspect_ratio: Optional[float] = None
+        self._crop_drag_mode = None
+        self._crop_start_scene_pos = None
+        self._crop_start_rect = None
+        self._crop_active_handle = None
+        self._crop_min_size = 20.0
+        self._handle_size = 12.0
 
     def set_image(self, pixmap: QPixmap):
         """Set the image to display."""
@@ -80,6 +221,256 @@ class ZoomableImageViewer(QGraphicsView):
             self.fit_to_window()
 
         self.has_image = True
+
+    def clear_image(self):
+        """Clear image and reset crop state."""
+        self.scene.clear()
+        self.image_item = None
+        self.has_image = False
+        self.crop_rect_scene = None
+        self.crop_mode_enabled = False
+        self.viewport().unsetCursor()
+
+    def _scene_image_rect(self) -> Optional[QRectF]:
+        if not self.image_item:
+            return None
+        return self.image_item.boundingRect()
+
+    def _normalized_to_scene_rect(self, rect_norm: Tuple[float, float, float, float]) -> Optional[QRectF]:
+        image_rect = self._scene_image_rect()
+        if not image_rect:
+            return None
+
+        left, top, right, bottom = clamp_normalized_rect(rect_norm)
+        x = image_rect.left() + (left * image_rect.width())
+        y = image_rect.top() + (top * image_rect.height())
+        w = (right - left) * image_rect.width()
+        h = (bottom - top) * image_rect.height()
+        return QRectF(x, y, max(1.0, w), max(1.0, h))
+
+    def _scene_rect_to_normalized(self, rect: QRectF) -> Optional[Tuple[float, float, float, float]]:
+        image_rect = self._scene_image_rect()
+        if not image_rect or image_rect.width() <= 0 or image_rect.height() <= 0:
+            return None
+
+        left = (rect.left() - image_rect.left()) / image_rect.width()
+        top = (rect.top() - image_rect.top()) / image_rect.height()
+        right = (rect.right() - image_rect.left()) / image_rect.width()
+        bottom = (rect.bottom() - image_rect.top()) / image_rect.height()
+        return clamp_normalized_rect((left, top, right, bottom))
+
+    def _default_crop_rect(self) -> Optional[QRectF]:
+        image_rect = self._scene_image_rect()
+        if not image_rect:
+            return None
+        return QRectF(
+            image_rect.left() + image_rect.width() * 0.1,
+            image_rect.top() + image_rect.height() * 0.1,
+            image_rect.width() * 0.8,
+            image_rect.height() * 0.8,
+        )
+
+    def _clamp_crop_rect(self, rect: QRectF) -> Optional[QRectF]:
+        image_rect = self._scene_image_rect()
+        if not image_rect:
+            return None
+
+        width = max(self._crop_min_size, min(rect.width(), image_rect.width()))
+        height = max(self._crop_min_size, min(rect.height(), image_rect.height()))
+        x = max(image_rect.left(), min(rect.left(), image_rect.right() - width))
+        y = max(image_rect.top(), min(rect.top(), image_rect.bottom() - height))
+        return QRectF(x, y, width, height)
+
+    def _apply_aspect_ratio(self, rect: QRectF, anchor=None) -> QRectF:
+        if not self.crop_aspect_ratio or self.crop_aspect_ratio <= 0:
+            return rect
+
+        ratio = self.crop_aspect_ratio
+        width = max(self._crop_min_size, rect.width())
+        height = max(self._crop_min_size, rect.height())
+        current_ratio = width / height
+
+        if current_ratio > ratio:
+            width = height * ratio
+        else:
+            height = width / ratio
+
+        if anchor is None:
+            center = rect.center()
+            return QRectF(center.x() - width / 2.0, center.y() - height / 2.0, width, height)
+
+        anchor_x, anchor_y = anchor
+        left = min(anchor_x, rect.left())
+        right = max(anchor_x, rect.left())
+        top = min(anchor_y, rect.top())
+        bottom = max(anchor_y, rect.top())
+
+        if rect.left() < anchor_x:
+            left = anchor_x - width
+            right = anchor_x
+        else:
+            left = anchor_x
+            right = anchor_x + width
+        if rect.top() < anchor_y:
+            top = anchor_y - height
+            bottom = anchor_y
+        else:
+            top = anchor_y
+            bottom = anchor_y + height
+        return QRectF(left, top, right - left, bottom - top)
+
+    def _set_crop_rect_scene(self, rect: QRectF, emit_signal=True):
+        rect = rect.normalized()
+        rect = self._apply_aspect_ratio(rect)
+        clamped = self._clamp_crop_rect(rect)
+        if not clamped:
+            return
+
+        self.crop_rect_scene = clamped
+        self.viewport().update()
+        if emit_signal:
+            rect_norm = self._scene_rect_to_normalized(clamped)
+            if rect_norm:
+                self.cropChanged.emit(rect_norm)
+
+    def enable_crop_mode(
+        self,
+        rect_norm: Optional[Tuple[float, float, float, float]] = None,
+        aspect_ratio: Optional[float] = None
+    ):
+        """Enable interactive crop mode."""
+        if not self.image_item:
+            return
+
+        self.crop_mode_enabled = True
+        self.crop_aspect_ratio = aspect_ratio
+        self.setDragMode(QGraphicsView.NoDrag)
+
+        if rect_norm:
+            initial_rect = self._normalized_to_scene_rect(rect_norm)
+        else:
+            initial_rect = self._default_crop_rect()
+
+        if initial_rect:
+            self._set_crop_rect_scene(initial_rect, emit_signal=False)
+
+        self.cropModeChanged.emit(True)
+        self.viewport().update()
+
+    def disable_crop_mode(self):
+        """Disable interactive crop mode."""
+        self.crop_mode_enabled = False
+        self._crop_drag_mode = None
+        self._crop_active_handle = None
+        self._crop_start_scene_pos = None
+        self._crop_start_rect = None
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.viewport().unsetCursor()
+        self.cropModeChanged.emit(False)
+        self.viewport().update()
+
+    def set_crop_aspect_ratio(self, aspect_ratio: Optional[float]):
+        """Set crop aspect ratio and update current rectangle."""
+        self.crop_aspect_ratio = aspect_ratio
+        if self.crop_rect_scene:
+            adjusted = self._apply_aspect_ratio(self.crop_rect_scene)
+            self._set_crop_rect_scene(adjusted, emit_signal=True)
+
+    def set_crop_rect_normalized(self, rect_norm: Tuple[float, float, float, float], emit_signal=True):
+        """Set crop rectangle from normalized coordinates."""
+        rect = self._normalized_to_scene_rect(rect_norm)
+        if rect:
+            self._set_crop_rect_scene(rect, emit_signal=emit_signal)
+
+    def get_crop_rect_normalized(self) -> Optional[Tuple[float, float, float, float]]:
+        """Get crop rectangle as normalized coordinates."""
+        if not self.crop_rect_scene:
+            return None
+        return self._scene_rect_to_normalized(self.crop_rect_scene)
+
+    def drawForeground(self, painter: QPainter, rect: QRectF):
+        """Draw crop overlay."""
+        super().drawForeground(painter, rect)
+        if not self.crop_mode_enabled or not self.crop_rect_scene:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(255, 214, 10), 2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self.crop_rect_scene)
+
+        for handle_rect in self._crop_handle_rects().values():
+            painter.fillRect(handle_rect, QColor(255, 214, 10))
+            painter.setPen(QPen(QColor(30, 30, 30), 1))
+            painter.drawRect(handle_rect)
+
+        painter.restore()
+
+    def _crop_handle_rects(self) -> Dict[str, QRectF]:
+        if not self.crop_rect_scene:
+            return {}
+
+        half = self._handle_size / 2.0
+        rect = self.crop_rect_scene
+        return {
+            "top_left": QRectF(rect.left() - half, rect.top() - half, self._handle_size, self._handle_size),
+            "top_right": QRectF(rect.right() - half, rect.top() - half, self._handle_size, self._handle_size),
+            "bottom_left": QRectF(rect.left() - half, rect.bottom() - half, self._handle_size, self._handle_size),
+            "bottom_right": QRectF(rect.right() - half, rect.bottom() - half, self._handle_size, self._handle_size),
+        }
+
+    def _hit_test_handle(self, scene_pos) -> Optional[str]:
+        for handle_name, handle_rect in self._crop_handle_rects().items():
+            if handle_rect.contains(scene_pos):
+                return handle_name
+        return None
+
+    def _resize_from_handle(self, handle_name: str, scene_pos) -> Optional[QRectF]:
+        if not self._crop_start_rect:
+            return None
+
+        start_rect = self._crop_start_rect
+        if handle_name == "top_left":
+            anchor = (start_rect.right(), start_rect.bottom())
+        elif handle_name == "top_right":
+            anchor = (start_rect.left(), start_rect.bottom())
+        elif handle_name == "bottom_left":
+            anchor = (start_rect.right(), start_rect.top())
+        else:
+            anchor = (start_rect.left(), start_rect.top())
+
+        left = min(anchor[0], scene_pos.x())
+        right = max(anchor[0], scene_pos.x())
+        top = min(anchor[1], scene_pos.y())
+        bottom = max(anchor[1], scene_pos.y())
+        new_rect = QRectF(left, top, right - left, bottom - top)
+
+        if self.crop_aspect_ratio and self.crop_aspect_ratio > 0:
+            width = max(self._crop_min_size, new_rect.width())
+            height = max(self._crop_min_size, new_rect.height())
+            target_ratio = self.crop_aspect_ratio
+            if width / height > target_ratio:
+                width = height * target_ratio
+            else:
+                height = width / target_ratio
+
+            if scene_pos.x() < anchor[0]:
+                left = anchor[0] - width
+                right = anchor[0]
+            else:
+                left = anchor[0]
+                right = anchor[0] + width
+            if scene_pos.y() < anchor[1]:
+                top = anchor[1] - height
+                bottom = anchor[1]
+            else:
+                top = anchor[1]
+                bottom = anchor[1] + height
+            new_rect = QRectF(left, top, right - left, bottom - top)
+
+        return new_rect
 
     def fit_to_window(self):
         """Fit the image to the window size."""
@@ -140,6 +531,24 @@ class ZoomableImageViewer(QGraphicsView):
 
     def mousePressEvent(self, event):
         """Handle mouse press events."""
+        if self.crop_mode_enabled and self.has_image and event.button() == Qt.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self._crop_active_handle = self._hit_test_handle(scene_pos)
+            self._crop_start_scene_pos = scene_pos
+            self._crop_start_rect = QRectF(self.crop_rect_scene) if self.crop_rect_scene else None
+
+            if self._crop_active_handle:
+                self._crop_drag_mode = "resize"
+            elif self.crop_rect_scene and self.crop_rect_scene.contains(scene_pos):
+                self._crop_drag_mode = "move"
+            else:
+                self._crop_drag_mode = "create"
+                self.crop_rect_scene = QRectF(scene_pos.x(), scene_pos.y(), 1.0, 1.0)
+                self.viewport().update()
+
+            event.accept()
+            return
+
         if event.button() == Qt.MiddleButton:
             # Middle click to fit to window
             self.fit_to_window()
@@ -150,9 +559,78 @@ class ZoomableImageViewer(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release events."""
+        if self.crop_mode_enabled and event.button() == Qt.LeftButton:
+            self._crop_drag_mode = None
+            self._crop_active_handle = None
+            self._crop_start_scene_pos = None
+            self._crop_start_rect = None
+            event.accept()
+            return
+
         if event.button() == Qt.LeftButton:
             self.setDragMode(QGraphicsView.RubberBandDrag)
         super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Handle crop interactions and cursor updates."""
+        if not self.crop_mode_enabled or not self.has_image:
+            super().mouseMoveEvent(event)
+            return
+
+        scene_pos = self.mapToScene(event.position().toPoint())
+        image_rect = self._scene_image_rect()
+        if not image_rect:
+            super().mouseMoveEvent(event)
+            return
+
+        if self._crop_drag_mode == "move" and self._crop_start_rect and self._crop_start_scene_pos:
+            delta = scene_pos - self._crop_start_scene_pos
+            moved_rect = self._crop_start_rect.translated(delta.x(), delta.y())
+            self._set_crop_rect_scene(moved_rect, emit_signal=True)
+            event.accept()
+            return
+
+        if self._crop_drag_mode == "resize" and self._crop_active_handle:
+            resized_rect = self._resize_from_handle(self._crop_active_handle, scene_pos)
+            if resized_rect:
+                self._set_crop_rect_scene(resized_rect, emit_signal=True)
+            event.accept()
+            return
+
+        if self._crop_drag_mode == "create" and self._crop_start_scene_pos:
+            start = self._crop_start_scene_pos
+            new_rect = QRectF(start.x(), start.y(), scene_pos.x() - start.x(), scene_pos.y() - start.y()).normalized()
+            if self.crop_aspect_ratio and self.crop_aspect_ratio > 0:
+                width = max(self._crop_min_size, new_rect.width())
+                height = max(self._crop_min_size, new_rect.height())
+                ratio = self.crop_aspect_ratio
+                if width / height > ratio:
+                    width = height * ratio
+                else:
+                    height = width / ratio
+                if scene_pos.x() < start.x():
+                    left = start.x() - width
+                else:
+                    left = start.x()
+                if scene_pos.y() < start.y():
+                    top = start.y() - height
+                else:
+                    top = start.y()
+                new_rect = QRectF(left, top, width, height)
+
+            self._set_crop_rect_scene(new_rect, emit_signal=True)
+            event.accept()
+            return
+
+        handle = self._hit_test_handle(scene_pos)
+        if handle:
+            self.viewport().setCursor(QCursor(Qt.SizeAllCursor))
+        elif self.crop_rect_scene and self.crop_rect_scene.contains(scene_pos):
+            self.viewport().setCursor(QCursor(Qt.OpenHandCursor))
+        else:
+            self.viewport().setCursor(QCursor(Qt.CrossCursor))
+
+        super().mouseMoveEvent(event)
 
     def resizeEvent(self, event):
         """Handle resize events."""
@@ -208,6 +686,24 @@ class PhotoMetadataEditor(QMainWindow):
         self.scaled_cache = OrderedDict()  # LRU cache for scaled images
         self.max_cache_size = 10  # Cache up to 10 images
         self.max_scaled_cache_size = 20  # Cache more scaled versions
+
+        # Non-destructive image edit state
+        self.photo_edit_states: Dict[str, PhotoEditState] = {}
+        self.last_crop_template: Optional[CropTemplate] = None
+        self.active_adjustment: Optional[str] = None
+        self.crop_aspect_options = OrderedDict([
+            ("freeform", ("Freeform", None)),
+            ("original", ("Original", "original")),
+            ("1:1", ("1:1", 1.0)),
+            ("4:5", ("4:5", 4.0 / 5.0)),
+            ("5:7", ("5:7", 5.0 / 7.0)),
+            ("3:2", ("3:2", 3.0 / 2.0)),
+            ("4:3", ("4:3", 4.0 / 3.0)),
+            ("16:9", ("16:9", 16.0 / 9.0)),
+        ])
+        self.preview_render_timer = QTimer()
+        self.preview_render_timer.setSingleShot(True)
+        self.preview_render_timer.timeout.connect(self.render_edit_preview)
         
         # Auto-save system
         self.pending_changes = {}
@@ -331,7 +827,11 @@ class PhotoMetadataEditor(QMainWindow):
         # Photo display viewer (zoomable)
         self.photo_viewer = ZoomableImageViewer()
         self.photo_viewer.setMinimumSize(400, 300)
+        self.photo_viewer.cropChanged.connect(self.on_crop_rect_changed)
         photo_layout.addWidget(self.photo_viewer)
+
+        # Edit controls under the image viewer
+        self.create_edit_controls(photo_layout)
 
         # Placeholder label for when no image is loaded
         self.placeholder_label = QLabel("Select a folder to view photos")
@@ -345,6 +845,88 @@ class PhotoMetadataEditor(QMainWindow):
         self.nav_info_label.setAlignment(Qt.AlignCenter)
         self.nav_info_label.setStyleSheet("QLabel { font-size: 12px; color: gray; }")
         photo_layout.addWidget(self.nav_info_label)
+
+    def create_edit_controls(self, parent_layout):
+        """Create non-destructive adjustment and crop controls."""
+        controls_row = QHBoxLayout()
+
+        self.brightness_btn = QPushButton("Brightness")
+        self.brightness_btn.clicked.connect(lambda: self.set_active_adjustment("brightness"))
+        controls_row.addWidget(self.brightness_btn)
+
+        self.contrast_btn = QPushButton("Contrast")
+        self.contrast_btn.clicked.connect(lambda: self.set_active_adjustment("contrast"))
+        controls_row.addWidget(self.contrast_btn)
+
+        self.saturation_btn = QPushButton("Saturation")
+        self.saturation_btn.clicked.connect(lambda: self.set_active_adjustment("saturation"))
+        controls_row.addWidget(self.saturation_btn)
+
+        self.white_balance_btn = QPushButton("White Balance")
+        self.white_balance_btn.clicked.connect(lambda: self.set_active_adjustment("temperature"))
+        controls_row.addWidget(self.white_balance_btn)
+
+        self.tint_btn = QPushButton("Tint")
+        self.tint_btn.clicked.connect(lambda: self.set_active_adjustment("tint"))
+        controls_row.addWidget(self.tint_btn)
+
+        self.crop_btn = QPushButton("Crop")
+        self.crop_btn.clicked.connect(self.toggle_crop_mode)
+        controls_row.addWidget(self.crop_btn)
+
+        controls_row.addStretch()
+
+        self.reset_edits_btn = QPushButton("Reset Edits")
+        self.reset_edits_btn.clicked.connect(self.reset_current_image_edits)
+        controls_row.addWidget(self.reset_edits_btn)
+
+        self.save_edits_btn = QPushButton("Save Edits")
+        self.save_edits_btn.clicked.connect(self.save_current_image_edits)
+        controls_row.addWidget(self.save_edits_btn)
+
+        parent_layout.addLayout(controls_row)
+
+        self.adjustment_panel = QFrame()
+        adjustment_layout = QHBoxLayout(self.adjustment_panel)
+        adjustment_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.adjustment_label = QLabel("Adjust")
+        self.adjustment_label.setMinimumWidth(100)
+        adjustment_layout.addWidget(self.adjustment_label)
+
+        self.adjustment_slider = QSlider(Qt.Horizontal)
+        self.adjustment_slider.setRange(-100, 100)
+        self.adjustment_slider.valueChanged.connect(self.on_adjustment_slider_changed)
+        adjustment_layout.addWidget(self.adjustment_slider)
+
+        self.adjustment_value_label = QLabel("0")
+        self.adjustment_value_label.setMinimumWidth(35)
+        adjustment_layout.addWidget(self.adjustment_value_label)
+
+        self.reset_adjustment_btn = QPushButton("Reset")
+        self.reset_adjustment_btn.clicked.connect(self.reset_active_adjustment)
+        adjustment_layout.addWidget(self.reset_adjustment_btn)
+
+        self.adjustment_panel.hide()
+        parent_layout.addWidget(self.adjustment_panel)
+
+        self.crop_panel = QFrame()
+        crop_layout = QHBoxLayout(self.crop_panel)
+        crop_layout.setContentsMargins(0, 0, 0, 0)
+        crop_layout.addWidget(QLabel("Crop Aspect"))
+        self.crop_aspect_combo = QComboBox()
+        for aspect_key, (label, _) in self.crop_aspect_options.items():
+            self.crop_aspect_combo.addItem(label, aspect_key)
+        self.crop_aspect_combo.currentIndexChanged.connect(self.on_crop_aspect_changed)
+        crop_layout.addWidget(self.crop_aspect_combo)
+        crop_layout.addStretch()
+        self.crop_hint_label = QLabel("Drag to move/resize crop")
+        self.crop_hint_label.setStyleSheet("QLabel { color: gray; font-size: 11px; }")
+        crop_layout.addWidget(self.crop_hint_label)
+        self.crop_panel.hide()
+        parent_layout.addWidget(self.crop_panel)
+
+        self._set_edit_controls_enabled(False)
 
     def create_rotation_toolbar(self, parent_layout):
         """Create the rotation toolbar above the image viewer."""
@@ -380,6 +962,401 @@ class PhotoMetadataEditor(QMainWindow):
 
         # Add the rotation layout to the parent
         parent_layout.addLayout(rotation_layout)
+
+    def _set_edit_controls_enabled(self, enabled: bool):
+        """Enable or disable all image edit controls."""
+        for button in [
+            self.brightness_btn,
+            self.contrast_btn,
+            self.saturation_btn,
+            self.white_balance_btn,
+            self.tint_btn,
+            self.crop_btn,
+            self.reset_edits_btn,
+            self.save_edits_btn,
+        ]:
+            button.setEnabled(enabled)
+
+        self.adjustment_slider.setEnabled(enabled)
+        self.reset_adjustment_btn.setEnabled(enabled)
+        self.crop_aspect_combo.setEnabled(enabled)
+
+    def _current_photo_path(self) -> Optional[str]:
+        if not self.photo_files or self.current_photo_index >= len(self.photo_files):
+            return None
+        return self.photo_files[self.current_photo_index]
+
+    def get_or_create_edit_state(self, photo_path: str) -> PhotoEditState:
+        """Return non-destructive draft edit state for a photo."""
+        state = self.photo_edit_states.get(photo_path)
+        if not state:
+            state = PhotoEditState()
+            self.photo_edit_states[photo_path] = state
+        return state
+
+    def _set_state_dirty(self, state: PhotoEditState):
+        state.is_dirty = state.has_effective_changes()
+
+    def _aspect_ratio_for_key(self, aspect_key: str) -> Optional[float]:
+        if aspect_key not in self.crop_aspect_options:
+            return None
+
+        ratio_value = self.crop_aspect_options[aspect_key][1]
+        if ratio_value == "original":
+            if self.current_image and self.current_image.height:
+                return self.current_image.width / self.current_image.height
+            return None
+        return ratio_value
+
+    def _set_crop_combo_value(self, aspect_key: str):
+        idx = self.crop_aspect_combo.findData(aspect_key)
+        if idx >= 0:
+            self.crop_aspect_combo.blockSignals(True)
+            self.crop_aspect_combo.setCurrentIndex(idx)
+            self.crop_aspect_combo.blockSignals(False)
+
+    def set_active_adjustment(self, control_name: Optional[str]):
+        """Activate one slider-driven adjustment control at a time."""
+        photo_path = self._current_photo_path()
+        if not photo_path or not self.current_image:
+            return
+
+        if self.photo_viewer.crop_mode_enabled:
+            self.exit_crop_mode(apply_preview=False)
+
+        if control_name is None:
+            self.active_adjustment = None
+            self.adjustment_panel.hide()
+            self.render_edit_preview()
+            return
+
+        self.active_adjustment = control_name
+        state = self.get_or_create_edit_state(photo_path)
+
+        label_map = {
+            "brightness": "Brightness",
+            "contrast": "Contrast",
+            "saturation": "Saturation",
+            "temperature": "White Balance",
+            "tint": "Tint",
+        }
+        value = getattr(state, control_name)
+        self.adjustment_label.setText(label_map.get(control_name, "Adjust"))
+        self.adjustment_slider.blockSignals(True)
+        self.adjustment_slider.setValue(int(value))
+        self.adjustment_slider.blockSignals(False)
+        self.adjustment_value_label.setText(str(int(value)))
+        self.adjustment_panel.show()
+        self.crop_panel.hide()
+        self.render_edit_preview()
+
+    def on_adjustment_slider_changed(self, value: int):
+        """Handle slider changes and schedule real-time preview."""
+        photo_path = self._current_photo_path()
+        if not photo_path or not self.active_adjustment:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        setattr(state, self.active_adjustment, int(value))
+        self._set_state_dirty(state)
+        self.adjustment_value_label.setText(str(int(value)))
+        self.preview_render_timer.start(35)
+
+    def reset_active_adjustment(self):
+        """Reset the currently active adjustment slider."""
+        if not self.active_adjustment:
+            return
+        self.adjustment_slider.setValue(0)
+
+    def toggle_crop_mode(self):
+        """Toggle crop mode."""
+        if self.photo_viewer.crop_mode_enabled:
+            self.exit_crop_mode(apply_preview=True)
+        else:
+            self.enter_crop_mode()
+
+    def enter_crop_mode(self):
+        """Enable draggable crop interface."""
+        photo_path = self._current_photo_path()
+        if not photo_path or not self.current_image:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        self.active_adjustment = None
+        self.adjustment_panel.hide()
+        self.crop_panel.show()
+        self.crop_btn.setText("Done Crop")
+
+        aspect_key = state.crop_aspect
+        rect_norm = state.crop_rect_norm
+
+        if rect_norm is None and self.last_crop_template:
+            rect_norm = self.last_crop_template.crop_rect_norm
+            aspect_key = self.last_crop_template.crop_aspect
+            state.crop_rect_norm = rect_norm
+            state.crop_aspect = aspect_key
+            self._set_state_dirty(state)
+
+        if aspect_key not in self.crop_aspect_options:
+            aspect_key = "freeform"
+            state.crop_aspect = aspect_key
+
+        self._set_crop_combo_value(aspect_key)
+        self.photo_viewer.enable_crop_mode(
+            rect_norm=rect_norm,
+            aspect_ratio=self._aspect_ratio_for_key(aspect_key),
+        )
+        if rect_norm:
+            self.photo_viewer.set_crop_rect_normalized(rect_norm, emit_signal=False)
+
+        self.render_edit_preview()
+
+    def exit_crop_mode(self, apply_preview=True):
+        """Disable crop mode and show adjusted/cropped preview."""
+        if self.photo_viewer.crop_mode_enabled:
+            self.photo_viewer.disable_crop_mode()
+        self.crop_btn.setText("Crop")
+        self.crop_panel.hide()
+        if apply_preview:
+            self.render_edit_preview()
+
+    def on_crop_aspect_changed(self, _index=None):
+        """Handle crop aspect ratio selection."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        aspect_key = self.crop_aspect_combo.currentData()
+        if not aspect_key:
+            aspect_key = "freeform"
+
+        state.crop_aspect = aspect_key
+        self.photo_viewer.set_crop_aspect_ratio(self._aspect_ratio_for_key(aspect_key))
+        if state.crop_rect_norm:
+            self.last_crop_template = CropTemplate(state.crop_rect_norm, state.crop_aspect)
+        self._set_state_dirty(state)
+        if not self.photo_viewer.crop_mode_enabled:
+            self.preview_render_timer.start(35)
+
+    def on_crop_rect_changed(self, rect_norm):
+        """Sync crop rectangle from viewer to draft state."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        normalized = clamp_normalized_rect(tuple(rect_norm))
+        state.crop_rect_norm = normalized
+        self._set_state_dirty(state)
+        self.last_crop_template = CropTemplate(normalized, state.crop_aspect)
+        if not self.photo_viewer.crop_mode_enabled:
+            self.preview_render_timer.start(35)
+
+    def _current_preview_dimension(self) -> int:
+        viewport = self.photo_viewer.viewport().size()
+        longest = max(1, max(viewport.width(), viewport.height()))
+        return max(1400, min(2600, longest * 2))
+
+    def render_edit_preview(self):
+        """Render non-destructive preview from base image + draft settings."""
+        photo_path = self._current_photo_path()
+        if not photo_path or not self.current_image:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        preview_image = apply_photo_adjustments(
+            self.current_image,
+            state,
+            apply_crop=not self.photo_viewer.crop_mode_enabled,
+            preview_max_dimension=self._current_preview_dimension(),
+        )
+        preview_pixmap = self._pil_to_qpixmap(preview_image)
+
+        if self.manual_rotation != 0:
+            transform = QTransform()
+            transform.rotate(self.manual_rotation)
+            preview_pixmap = preview_pixmap.transformed(transform, Qt.SmoothTransformation)
+
+        self.photo_viewer.set_image(preview_pixmap)
+
+        if self.photo_viewer.crop_mode_enabled:
+            self.photo_viewer.set_crop_aspect_ratio(self._aspect_ratio_for_key(state.crop_aspect))
+            if state.crop_rect_norm:
+                self.photo_viewer.set_crop_rect_normalized(state.crop_rect_norm, emit_signal=False)
+
+        self.placeholder_label.hide()
+        self.photo_viewer.show()
+
+    def has_unsaved_image_edits(self) -> bool:
+        """Check if current photo has non-destructive edits not saved yet."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return False
+
+        state = self.photo_edit_states.get(photo_path)
+        if not state:
+            return False
+
+        self._set_state_dirty(state)
+        return state.is_dirty
+
+    def prompt_unsaved_image_edits(self) -> str:
+        """Prompt user for unsaved image edit behavior."""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("Unsaved Image Edits")
+        dialog.setText("This photo has unsaved image edits.")
+        dialog.setInformativeText("Save changes before navigating away?")
+
+        save_btn = dialog.addButton("Save", QMessageBox.AcceptRole)
+        discard_btn = dialog.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel_btn = dialog.addButton("Cancel", QMessageBox.RejectRole)
+        dialog.setDefaultButton(save_btn)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked == save_btn:
+            return "save"
+        if clicked == discard_btn:
+            return "discard"
+        return "cancel"
+
+    def _clear_caches_for_photo(self, photo_path: str):
+        """Clear image/pixmap cache entries for one photo path."""
+        if photo_path in self.image_cache:
+            try:
+                self.image_cache[photo_path].close()
+            except Exception:
+                pass
+            del self.image_cache[photo_path]
+
+        keys_to_remove = [key for key in self.scaled_cache.keys() if key.startswith(photo_path)]
+        for key in keys_to_remove:
+            del self.scaled_cache[key]
+
+    def save_current_image_edits(self) -> bool:
+        """Persist draft image edits to the current file path."""
+        photo_path = self._current_photo_path()
+        if not photo_path or not self.current_image:
+            return False
+
+        state = self.get_or_create_edit_state(photo_path)
+        self._set_state_dirty(state)
+        if not state.is_dirty:
+            self.update_status("No image edits to save")
+            return True
+
+        tmp_path = None
+        try:
+            # Prevent metadata/rotation race conditions before manual image save.
+            if self.pending_changes:
+                self.auto_save_timer.stop()
+                self.save_pending_metadata()
+
+            if hasattr(self, 'rotation_save_timer') and self.rotation_save_timer.isActive():
+                self.rotation_save_timer.stop()
+                self.save_rotation_to_file()
+
+            if self.photo_viewer.crop_mode_enabled:
+                self.exit_crop_mode(apply_preview=False)
+
+            backup_path = photo_path + ".backup"
+            if not os.path.exists(backup_path):
+                shutil.copy2(photo_path, backup_path)
+
+            # Keep latest EXIF/ICC profile while writing updated pixel data once.
+            try:
+                exif_dict = piexif.load(photo_path)
+            except Exception:
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+            if "0th" not in exif_dict:
+                exif_dict["0th"] = {}
+            exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
+            exif_bytes = piexif.dump(exif_dict)
+
+            source_format = "JPEG"
+            icc_profile = None
+            try:
+                with Image.open(photo_path) as source_file:
+                    source_format = source_file.format or "JPEG"
+                    icc_profile = source_file.info.get("icc_profile")
+            except Exception:
+                pass
+
+            edited_image = apply_photo_adjustments(
+                self.current_image,
+                state,
+                apply_crop=True,
+                preview_max_dimension=None,
+            )
+
+            if self.manual_rotation == 90:
+                edited_image = edited_image.transpose(Image.Transpose.ROTATE_270)
+            elif self.manual_rotation == 180:
+                edited_image = edited_image.transpose(Image.Transpose.ROTATE_180)
+            elif self.manual_rotation == 270:
+                edited_image = edited_image.transpose(Image.Transpose.ROTATE_90)
+
+            save_kwargs = {"exif": exif_bytes}
+            if icc_profile:
+                save_kwargs["icc_profile"] = icc_profile
+            if photo_path.lower().endswith((".jpg", ".jpeg")):
+                save_kwargs["quality"] = 95
+                save_kwargs["optimize"] = True
+
+            fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=os.path.dirname(photo_path))
+            os.close(fd)
+            edited_image.save(tmp_path, format=source_format, **save_kwargs)
+            os.replace(tmp_path, photo_path)
+
+            self._clear_caches_for_photo(photo_path)
+            self.current_image = self._get_cached_image(photo_path)
+            self.manual_rotation = 0
+            self.rotation_label.setText("0°")
+            if state.crop_rect_norm:
+                self.last_crop_template = CropTemplate(state.crop_rect_norm, state.crop_aspect)
+            self.photo_edit_states[photo_path] = PhotoEditState()
+            self.active_adjustment = None
+            self.adjustment_panel.hide()
+            self.crop_panel.hide()
+            self.crop_btn.setText("Crop")
+            self.render_edit_preview()
+            self.update_status("✓ Image edits saved")
+            return True
+        except Exception as e:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            self.update_status(f"Error saving image edits: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save image edits: {str(e)}")
+            return False
+
+    def discard_current_image_edits(self) -> bool:
+        """Discard draft image edits for current photo."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return False
+
+        self.photo_edit_states[photo_path] = PhotoEditState()
+        self.active_adjustment = None
+        self.adjustment_panel.hide()
+        self.exit_crop_mode(apply_preview=False)
+        self.render_edit_preview()
+        self.update_status("Draft image edits discarded")
+        return True
+
+    def reset_current_image_edits(self):
+        """Reset current draft image edits back to defaults."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        self.photo_edit_states[photo_path] = PhotoEditState()
+        self.active_adjustment = None
+        self.adjustment_panel.hide()
+        self.exit_crop_mode(apply_preview=False)
+        self._set_crop_combo_value("freeform")
+        self.render_edit_preview()
 
     def create_metadata_panel(self, parent):
         """Create the metadata editing panel."""
@@ -600,7 +1577,8 @@ METADATA EDITING:
 • Copy from Previous: Click to copy all metadata from the previously viewed photo
 
 FEATURES:
-• All changes are saved automatically to EXIF data
+• Metadata fields auto-save to EXIF data
+• Image touch-up and crop edits are non-destructive until 'Save Edits'
 • Metadata is compatible with Apple Photos
 • GPS coordinates are added for location entries
 • Supports JPEG files with EXIF data
@@ -626,6 +1604,8 @@ The application creates backup files (.backup) before modifying originals."""
         try:
             # Clear caches when loading new folder
             self._clear_image_caches()
+            self.photo_edit_states.clear()
+            self.last_crop_template = None
 
             self.current_folder = folder_path
             self.folder_path_label.setText(f"Folder: {os.path.basename(folder_path)}")
@@ -834,8 +1814,16 @@ The application creates backup files (.backup) before modifying originals."""
             # Enable rotation buttons
             self.rotate_left_btn.setEnabled(True)
             self.rotate_right_btn.setEnabled(True)
+            self._set_edit_controls_enabled(True)
 
-            # Scale image to fit viewer
+            # Close crop mode/slider when switching photos
+            self.active_adjustment = None
+            self.adjustment_panel.hide()
+            self.crop_panel.hide()
+            self.crop_btn.setText("Crop")
+            self.photo_viewer.disable_crop_mode()
+
+            # Render non-destructive preview
             self.display_scaled_image()
 
             # Load metadata
@@ -865,30 +1853,7 @@ The application creates backup files (.backup) before modifying originals."""
         if not self.current_image or not self.photo_files:
             return
 
-        # Get the original image size
-        img_width, img_height = self.current_image.size
-
-        # Create a QPixmap from the original image (no pre-scaling needed)
-        photo_path = self.photo_files[self.current_photo_index]
-
-        # Use the original image size for the pixmap to maintain quality
-        original_pixmap = self._get_cached_scaled_pixmap(photo_path, (img_width, img_height))
-
-        # Apply manual rotation if needed
-        if self.manual_rotation != 0:
-            # Create a transformation matrix for rotation
-            transform = QTransform()
-            transform.rotate(self.manual_rotation)
-
-            # Apply the rotation to the pixmap
-            original_pixmap = original_pixmap.transformed(transform, Qt.SmoothTransformation)
-
-        # Set the image in the viewer (it will handle scaling automatically)
-        self.photo_viewer.set_image(original_pixmap)
-
-        # Hide placeholder and show viewer
-        self.placeholder_label.hide()
-        self.photo_viewer.show()
+        self.render_edit_preview()
 
     def show_placeholder(self, message="Select a folder to view photos"):
         """Show placeholder message when no image is loaded."""
@@ -896,14 +1861,18 @@ The application creates backup files (.backup) before modifying originals."""
         self.placeholder_label.show()
         # Clear the image viewer
         if hasattr(self, 'photo_viewer'):
-            self.photo_viewer.scene.clear()
-            self.photo_viewer.has_image = False
+            self.photo_viewer.clear_image()
 
         # Disable rotation buttons when no image is loaded
         if hasattr(self, 'rotate_left_btn'):
             self.rotate_left_btn.setEnabled(False)
             self.rotate_right_btn.setEnabled(False)
             self.rotation_label.setText("0°")
+        if hasattr(self, 'brightness_btn'):
+            self._set_edit_controls_enabled(False)
+            self.adjustment_panel.hide()
+            self.crop_panel.hide()
+            self.crop_btn.setText("Crop")
 
     def _preload_adjacent_images(self):
         """Preload adjacent images in background for smooth navigation."""
@@ -971,12 +1940,27 @@ The application creates backup files (.backup) before modifying originals."""
         """Navigate to the next photo with debouncing."""
         self._debounced_navigation("next")
 
+    def _resolve_unsaved_image_edits_before_navigation(self) -> bool:
+        """Return True if navigation should continue, False to cancel."""
+        if not self.has_unsaved_image_edits():
+            return True
+
+        decision = self.prompt_unsaved_image_edits()
+        if decision == "save":
+            return self.save_current_image_edits()
+        if decision == "discard":
+            return self.discard_current_image_edits()
+        return False
+
     def _navigate_previous(self):
         """Internal method to navigate to previous photo."""
         if not self.photo_files:
             return
 
         if self.current_photo_index > 0:
+            if not self._resolve_unsaved_image_edits_before_navigation():
+                return
+
             # Save any pending changes before navigating to prevent data loss
             self._save_pending_changes_before_navigation()
 
@@ -994,6 +1978,9 @@ The application creates backup files (.backup) before modifying originals."""
             return
 
         if self.current_photo_index < len(self.photo_files) - 1:
+            if not self._resolve_unsaved_image_edits_before_navigation():
+                return
+
             # Save any pending changes before navigating to prevent data loss
             self._save_pending_changes_before_navigation()
 
@@ -2108,6 +3095,8 @@ The application creates backup files (.backup) before modifying originals."""
             self._polling_timer.stop()
         if hasattr(self, 'rotation_save_timer'):
             self.rotation_save_timer.stop()
+        if hasattr(self, 'preview_render_timer'):
+            self.preview_render_timer.stop()
 
         # Save any pending changes
         if self.pending_changes:
@@ -2129,6 +3118,7 @@ The application creates backup files (.backup) before modifying originals."""
 
         # Clean up pixmap reference
         self.current_pixmap = None
+        self.photo_edit_states.clear()
 
 
 def main():
