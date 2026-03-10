@@ -6,7 +6,7 @@ A desktop application for editing metadata of scanned photos with Apple Photos c
 
 import os
 import sys
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from collections import OrderedDict
 import threading
 import time
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame, QSlider,
     QComboBox,
-    QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter,
+    QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter, QInputDialog,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent, QRectF
@@ -737,6 +737,8 @@ class PhotoMetadataEditor(QMainWindow):
         self.highlighted_suggestion_index = -1
         self._last_selected_location = None
         self.previous_photo_metadata = {}
+        self.photo_tags: Dict[str, Set[str]] = {}
+        self.tag_display_names: Dict[str, str] = {}
         
         # Geocoding state
         self._geocoding_results_ready = False
@@ -803,7 +805,12 @@ class PhotoMetadataEditor(QMainWindow):
         help_action = QAction("Help", self)
         help_action.triggered.connect(self.show_help)
         toolbar.addAction(help_action)
-        
+
+        # Bulk move action
+        move_tagged_action = QAction("Move Tagged Photos", self)
+        move_tagged_action.triggered.connect(self.move_tagged_photos)
+        toolbar.addAction(move_tagged_action)
+
         toolbar.addSeparator()
         
         # Folder path label
@@ -1404,6 +1411,7 @@ class PhotoMetadataEditor(QMainWindow):
         self.create_caption_field()
         self.create_location_field()
         self.create_copy_from_previous_button()
+        self.create_tagging_section()
         
         # Auto-save status
         self.autosave_label = QLabel("Changes are saved automatically")
@@ -1533,11 +1541,348 @@ class PhotoMetadataEditor(QMainWindow):
         self.copy_from_previous_btn.setEnabled(False)
         self.copy_from_previous_btn.clicked.connect(self.copy_from_previous_photo)
         self.metadata_content_layout.addWidget(self.copy_from_previous_btn)
-        
+
         # Copy hint
         self.copy_hint_label = QLabel("No previous photo metadata available")
         self.copy_hint_label.setStyleSheet("QLabel { font-size: 10px; color: gray; }")
         self.metadata_content_layout.addWidget(self.copy_hint_label)
+
+    def create_tagging_section(self):
+        """Create tagging controls for session batch operations."""
+        tagging_frame = QFrame()
+        tagging_frame.setFrameStyle(QFrame.StyledPanel)
+        self.metadata_content_layout.addWidget(tagging_frame)
+
+        tagging_layout = QVBoxLayout(tagging_frame)
+
+        tagging_label = QLabel("Session Tagging:")
+        tag_font = QFont()
+        tag_font.setBold(True)
+        tagging_label.setFont(tag_font)
+        tagging_layout.addWidget(tagging_label)
+
+        input_row = QHBoxLayout()
+        self.tag_entry = QLineEdit()
+        self.tag_entry.setPlaceholderText("Enter tag name...")
+        self.tag_entry.returnPressed.connect(self.add_tag_to_current_photo)
+        input_row.addWidget(self.tag_entry)
+
+        self.add_tag_btn = QPushButton("Add Tag")
+        self.add_tag_btn.clicked.connect(self.add_tag_to_current_photo)
+        input_row.addWidget(self.add_tag_btn)
+
+        self.remove_tag_btn = QPushButton("Remove Tag")
+        self.remove_tag_btn.clicked.connect(self.remove_tag_from_current_photo)
+        input_row.addWidget(self.remove_tag_btn)
+        tagging_layout.addLayout(input_row)
+
+        self.current_tags_label = QLabel("Current photo tags: none")
+        self.current_tags_label.setWordWrap(True)
+        tagging_layout.addWidget(self.current_tags_label)
+
+        self.tag_summary_label = QLabel("Session tags: none")
+        self.tag_summary_label.setStyleSheet("QLabel { font-size: 10px; color: gray; }")
+        self.tag_summary_label.setWordWrap(True)
+        tagging_layout.addWidget(self.tag_summary_label)
+
+        self.move_tagged_btn = QPushButton("Move Tagged Photos...")
+        self.move_tagged_btn.clicked.connect(self.move_tagged_photos)
+        tagging_layout.addWidget(self.move_tagged_btn)
+
+        tag_hint = QLabel("Tag photos during review, then move an entire tag group at once.")
+        tag_hint.setStyleSheet("QLabel { font-size: 10px; color: gray; }")
+        tag_hint.setWordWrap(True)
+        tagging_layout.addWidget(tag_hint)
+
+        self._set_tagging_controls_enabled(False)
+
+    def _normalize_tag(self, tag_text: str) -> str:
+        """Normalize tag text for consistent matching."""
+        return " ".join(tag_text.strip().split())
+
+    def _canonicalize_tag(self, tag_text: str) -> str:
+        normalized = self._normalize_tag(tag_text)
+        return normalized.lower()
+
+    def _display_tag(self, canonical_tag: str) -> str:
+        return self.tag_display_names.get(canonical_tag, canonical_tag)
+
+    def _tag_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for tags in self.photo_tags.values():
+            for tag in tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        return counts
+
+    def _photo_paths_for_tag(self, canonical_tag: str) -> List[str]:
+        return [path for path in self.photo_files if canonical_tag in self.photo_tags.get(path, set())]
+
+    def _cleanup_unused_tag_names(self):
+        """Remove display names for tags no longer present in the session."""
+        active_tags = {tag for tags in self.photo_tags.values() for tag in tags}
+        self.tag_display_names = {
+            canonical: display
+            for canonical, display in self.tag_display_names.items()
+            if canonical in active_tags
+        }
+
+    def _set_tagging_controls_enabled(self, enabled: bool):
+        self.tag_entry.setEnabled(enabled)
+        self.add_tag_btn.setEnabled(enabled)
+        self.remove_tag_btn.setEnabled(enabled)
+
+    def update_tagging_ui(self):
+        """Refresh tagging labels/button states based on current session state."""
+        current_path = self._current_photo_path()
+        has_photo = current_path is not None
+
+        self._set_tagging_controls_enabled(has_photo)
+
+        current_tags = sorted(
+            self.photo_tags.get(current_path, set()) if current_path else set(),
+            key=lambda tag: self._display_tag(tag).lower()
+        )
+        if current_tags:
+            current_display = ", ".join(self._display_tag(tag) for tag in current_tags)
+            self.current_tags_label.setText(f"Current photo tags: {current_display}")
+        else:
+            self.current_tags_label.setText("Current photo tags: none")
+
+        counts = self._tag_counts()
+        if counts:
+            summary = ", ".join(
+                f"{self._display_tag(tag)} ({counts[tag]})"
+                for tag in sorted(counts.keys(), key=lambda t: self._display_tag(t).lower())
+            )
+            self.tag_summary_label.setText(f"Session tags: {summary}")
+            self.move_tagged_btn.setEnabled(True)
+        else:
+            self.tag_summary_label.setText("Session tags: none")
+            self.move_tagged_btn.setEnabled(False)
+
+    def add_tag_to_current_photo(self):
+        """Apply a tag to the current photo."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            self.update_status("No photo selected to tag")
+            return
+
+        tag_text = self._normalize_tag(self.tag_entry.text())
+        canonical_tag = self._canonicalize_tag(tag_text)
+        if not canonical_tag:
+            self.update_status("Enter a tag name first")
+            return
+
+        self.tag_display_names.setdefault(canonical_tag, tag_text)
+        photo_tag_set = self.photo_tags.setdefault(photo_path, set())
+        if canonical_tag in photo_tag_set:
+            self.update_status(f"Tag '{self._display_tag(canonical_tag)}' is already on this photo")
+            return
+
+        photo_tag_set.add(canonical_tag)
+        self.update_tagging_ui()
+        self.update_status(f"Added tag '{self._display_tag(canonical_tag)}'")
+
+    def remove_tag_from_current_photo(self):
+        """Remove a tag from the current photo."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            self.update_status("No photo selected to untag")
+            return
+
+        tag_text = self._normalize_tag(self.tag_entry.text())
+        canonical_tag = self._canonicalize_tag(tag_text)
+        if not canonical_tag:
+            self.update_status("Enter a tag name first")
+            return
+
+        photo_tag_set = self.photo_tags.get(photo_path)
+        if not photo_tag_set or canonical_tag not in photo_tag_set:
+            self.update_status(f"Tag '{tag_text}' is not on this photo")
+            return
+
+        removed_tag_display = self._display_tag(canonical_tag)
+        photo_tag_set.remove(canonical_tag)
+        if not photo_tag_set:
+            self.photo_tags.pop(photo_path, None)
+        self._cleanup_unused_tag_names()
+        self.update_tagging_ui()
+        self.update_status(f"Removed tag '{removed_tag_display}'")
+
+    def _build_unique_destination_path(self, destination_folder: str, filename: str) -> str:
+        """Avoid overwrite by appending an incrementing suffix when needed."""
+        base_name, extension = os.path.splitext(filename)
+        candidate = os.path.join(destination_folder, filename)
+        suffix = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(destination_folder, f"{base_name}_{suffix}{extension}")
+            suffix += 1
+        return candidate
+
+    def _release_photo_resources(self, photo_path: str):
+        """Drop cached image resources for a photo so it can be moved safely."""
+        cached_image = self.image_cache.pop(photo_path, None)
+        if cached_image:
+            try:
+                cached_image.close()
+            except Exception:
+                pass
+
+        keys_to_remove = [key for key in self.scaled_cache.keys() if key.startswith(photo_path)]
+        for key in keys_to_remove:
+            self.scaled_cache.pop(key, None)
+
+    def move_photos_for_tag(self, canonical_tag: str, destination_folder: str):
+        """Move all photos with a specific tag; returns (moved, failed)."""
+        canonical_tag = self._canonicalize_tag(canonical_tag)
+        if not canonical_tag:
+            return [], []
+        if not os.path.isdir(destination_folder):
+            return [], [(destination_folder, "Destination folder does not exist")]
+
+        tagged_paths = self._photo_paths_for_tag(canonical_tag)
+        moved = []
+        failed = []
+        destination_abs = os.path.abspath(destination_folder)
+
+        for source_path in tagged_paths:
+            if not os.path.exists(source_path):
+                failed.append((source_path, "File no longer exists"))
+                continue
+
+            if os.path.abspath(os.path.dirname(source_path)) == destination_abs:
+                failed.append((source_path, "File is already in the destination folder"))
+                continue
+
+            destination_path = self._build_unique_destination_path(destination_folder, os.path.basename(source_path))
+            try:
+                self._release_photo_resources(source_path)
+                shutil.move(source_path, destination_path)
+                moved.append((source_path, destination_path))
+            except Exception as err:
+                failed.append((source_path, str(err)))
+
+        if not moved:
+            return moved, failed
+
+        moved_sources = {source for source, _ in moved}
+        current_path = self._current_photo_path()
+        removed_indices = [index for index, path in enumerate(self.photo_files) if path in moved_sources]
+
+        if removed_indices:
+            removed_before_current = sum(1 for index in removed_indices if index < self.current_photo_index)
+            self.current_photo_index = max(0, self.current_photo_index - removed_before_current)
+
+        self.photo_files = [path for path in self.photo_files if path not in moved_sources]
+
+        for source_path in moved_sources:
+            self.photo_edit_states.pop(source_path, None)
+            self.photo_tags.pop(source_path, None)
+
+        self._cleanup_unused_tag_names()
+
+        if self.photo_files:
+            if current_path in moved_sources and self.current_photo_index >= len(self.photo_files):
+                self.current_photo_index = len(self.photo_files) - 1
+            self.current_photo_index = max(0, min(self.current_photo_index, len(self.photo_files) - 1))
+            self.load_current_photo()
+        else:
+            self.current_photo_index = 0
+            self.current_image = None
+            self.current_pixmap = None
+            self.previous_photo_metadata = {}
+            self.show_placeholder("No photos remaining in session")
+            self.photo_info_label.setText("No photo selected")
+            self.nav_info_label.setText("No photos loaded")
+            self.setWindowTitle("Photo Metadata Editor")
+            self.update_copy_button_state()
+            self.update_tagging_ui()
+
+        return moved, failed
+
+    def move_tagged_photos(self):
+        """Prompt for a tag and destination, then move tagged photos in bulk."""
+        tag_counts = self._tag_counts()
+        if not tag_counts:
+            QMessageBox.information(self, "No Tagged Photos", "No tags have been assigned in this session yet.")
+            return
+
+        ordered_tags = sorted(tag_counts.keys(), key=lambda tag: self._display_tag(tag).lower())
+        tag_options = [f"{self._display_tag(tag)} ({tag_counts[tag]})" for tag in ordered_tags]
+        selected_option, confirmed = QInputDialog.getItem(
+            self,
+            "Move Tagged Photos",
+            "Choose a tag to move:",
+            tag_options,
+            0,
+            False
+        )
+        if not confirmed:
+            return
+
+        selected_index = tag_options.index(selected_option)
+        selected_tag = ordered_tags[selected_index]
+        tagged_paths = self._photo_paths_for_tag(selected_tag)
+        if not tagged_paths:
+            QMessageBox.information(self, "No Matching Photos", "No photos currently match that tag.")
+            return
+
+        destination_folder = QFileDialog.getExistingDirectory(
+            self,
+            f"Select destination for '{self._display_tag(selected_tag)}' photos",
+            self.current_folder or os.path.expanduser("~")
+        )
+        if not destination_folder:
+            return
+
+        confirmation_text = (
+            f"Move {len(tagged_paths)} photo(s) tagged '{self._display_tag(selected_tag)}' to:\n\n"
+            f"{destination_folder}\n\n"
+            "Moved photos will be removed from the current session."
+        )
+        proceed = QMessageBox.question(
+            self,
+            "Confirm Bulk Move",
+            confirmation_text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if proceed != QMessageBox.Yes:
+            return
+
+        current_photo_path = self._current_photo_path()
+        if current_photo_path in tagged_paths:
+            if not self._resolve_unsaved_image_edits_before_navigation():
+                return
+
+        self._save_pending_changes_before_navigation()
+        moved, failed = self.move_photos_for_tag(selected_tag, destination_folder)
+        moved_count = len(moved)
+
+        if moved_count == 0 and failed:
+            error_lines = "\n".join(f"{os.path.basename(path)}: {reason}" for path, reason in failed[:10])
+            QMessageBox.warning(self, "Move Failed", f"No files were moved.\n\n{error_lines}")
+            self.update_status("No tagged photos were moved")
+            return
+
+        if failed:
+            error_lines = "\n".join(f"{os.path.basename(path)}: {reason}" for path, reason in failed[:10])
+            if len(failed) > 10:
+                error_lines += "\n..."
+            QMessageBox.warning(
+                self,
+                "Bulk Move Completed with Warnings",
+                f"Moved {moved_count} photo(s).\nFailed to move {len(failed)} photo(s):\n\n{error_lines}"
+            )
+            self.update_status(f"Moved {moved_count} photo(s), {len(failed)} failed")
+            return
+
+        QMessageBox.information(
+            self,
+            "Bulk Move Complete",
+            f"Moved {moved_count} photo(s) tagged '{self._display_tag(selected_tag)}'."
+        )
+        self.update_status(f"Moved {moved_count} tagged photo(s)")
         
     def create_status_bar(self):
         """Create the status bar."""
@@ -1562,6 +1907,13 @@ class PhotoMetadataEditor(QMainWindow):
         self.escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
         self.escape_shortcut.activated.connect(self.hide_all_suggestions)
 
+        # Tagging shortcuts
+        self.tag_photo_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self.tag_photo_shortcut.activated.connect(self.add_tag_to_current_photo)
+
+        self.move_tagged_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        self.move_tagged_shortcut.activated.connect(self.move_tagged_photos)
+
     def show_help(self):
         """Show help dialog."""
         help_text = """PHOTO METADATA EDITOR - HELP
@@ -1583,9 +1935,12 @@ FEATURES:
 • GPS coordinates are added for location entries
 • Supports JPEG files with EXIF data
 • Copy metadata between photos for batch processing
+• Tag photos during a session and bulk move by tag
 
 KEYBOARD SHORTCUTS:
 • Cmd+O: Open folder
+• Ctrl+T: Add entered tag to current photo
+• Ctrl+M: Move tagged photos
 • ← →: Navigate photos
 • Esc: Hide location suggestions
 
@@ -1606,6 +1961,9 @@ The application creates backup files (.backup) before modifying originals."""
             self._clear_image_caches()
             self.photo_edit_states.clear()
             self.last_crop_template = None
+            self.photo_tags.clear()
+            self.tag_display_names.clear()
+            self.previous_photo_metadata = {}
 
             self.current_folder = folder_path
             self.folder_path_label.setText(f"Folder: {os.path.basename(folder_path)}")
@@ -1630,6 +1988,7 @@ The application creates backup files (.backup) before modifying originals."""
                 self.load_current_photo()
                 self.update_status(f"Loaded {len(self.photo_files)} photos from {folder_path}")
             else:
+                self.update_tagging_ui()
                 self.update_status("No valid JPEG files found in selected folder")
                 QMessageBox.information(self, "No Photos", "No valid JPEG files found in the selected folder.")
 
@@ -1840,6 +2199,7 @@ The application creates backup files (.backup) before modifying originals."""
 
             # Update copy button state
             self.update_copy_button_state()
+            self.update_tagging_ui()
 
             # Preload adjacent images in background
             self._preload_adjacent_images()
@@ -1873,6 +2233,8 @@ The application creates backup files (.backup) before modifying originals."""
             self.adjustment_panel.hide()
             self.crop_panel.hide()
             self.crop_btn.setText("Crop")
+        if hasattr(self, 'tag_entry'):
+            self.update_tagging_ui()
 
     def _preload_adjacent_images(self):
         """Preload adjacent images in background for smooth navigation."""
