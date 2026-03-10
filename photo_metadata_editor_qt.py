@@ -39,6 +39,7 @@ import requests
 STAMP_FONT_FILES = OrderedDict([
     ("ds_digital", ("DS Digital", "/Users/jonathanjensen/Downloads/ds_digital/DS-DIGI.TTF")),
     ("courier_prime", ("Courier Prime", "/Users/jonathanjensen/Downloads/Courier_Prime/CourierPrime-Regular.ttf")),
+    ("open_sans", ("Open Sans", "/Library/Frameworks/R.framework/Versions/4.2-arm64/Resources/library/rmarkdown/rmd/h/bootstrap/css/fonts/OpenSans.ttf")),
 ])
 
 STAMP_COLOR_VALUES = {
@@ -72,6 +73,7 @@ class DateStampState:
     text_mode: str = "auto_date"
     color: str = "orange"
     font_key: str = "ds_digital"
+    size_adjust: int = 0
     anchor_corner: str = "bottom_left"
     position_norm: Optional[Tuple[float, float]] = None
     configured: bool = False
@@ -85,6 +87,7 @@ class DateStampTemplate:
     """Session-level stamp style reused when enabling the next photo."""
     color: str
     font_key: str
+    size_adjust: int
     anchor_corner: str
     position_norm: Optional[Tuple[float, float]]
 
@@ -251,7 +254,7 @@ def resolve_date_stamp_layout(
         return None
 
     shorter_dimension = min(width, height)
-    font_size = max(12, int(shorter_dimension * 0.04))
+    font_size = max(12, int(shorter_dimension * 0.04) + (stamp_state.size_adjust * 4))
     margin = max(8, int(shorter_dimension * 0.03))
     font = _load_stamp_font(font_resolver, stamp_state.font_key, font_size)
 
@@ -1285,6 +1288,21 @@ class PhotoMetadataEditor(QMainWindow):
         self.stamp_font_combo.currentIndexChanged.connect(self.on_stamp_font_changed)
         popup_layout.addWidget(self.stamp_font_combo)
 
+        popup_layout.addWidget(QLabel("Font Size"))
+        size_row = QHBoxLayout()
+        self.stamp_size_decrease_btn = QPushButton("-")
+        self.stamp_size_decrease_btn.setFixedWidth(36)
+        self.stamp_size_decrease_btn.clicked.connect(lambda: self.adjust_stamp_font_size(-1))
+        size_row.addWidget(self.stamp_size_decrease_btn)
+        self.stamp_size_label = QLabel("Default")
+        self.stamp_size_label.setAlignment(Qt.AlignCenter)
+        size_row.addWidget(self.stamp_size_label, 1)
+        self.stamp_size_increase_btn = QPushButton("+")
+        self.stamp_size_increase_btn.setFixedWidth(36)
+        self.stamp_size_increase_btn.clicked.connect(lambda: self.adjust_stamp_font_size(1))
+        size_row.addWidget(self.stamp_size_increase_btn)
+        popup_layout.addLayout(size_row)
+
         button_row = QHBoxLayout()
         button_row.addStretch()
         self.stamp_reset_position_btn = QPushButton("Reset Position")
@@ -1301,6 +1319,8 @@ class PhotoMetadataEditor(QMainWindow):
             self.stamp_color_combo,
             self.stamp_corner_combo,
             self.stamp_font_combo,
+            self.stamp_size_decrease_btn,
+            self.stamp_size_increase_btn,
             self.stamp_reset_position_btn,
         ]:
             widget.setEnabled(enabled)
@@ -1431,6 +1451,7 @@ class PhotoMetadataEditor(QMainWindow):
         return DateStampTemplate(
             color="orange",
             font_key="ds_digital",
+            size_adjust=0,
             anchor_corner="bottom_left",
             position_norm=None,
         )
@@ -1444,6 +1465,7 @@ class PhotoMetadataEditor(QMainWindow):
         template = self.last_stamp_template or self._default_stamp_template()
         stamp_state.color = template.color
         stamp_state.font_key = template.font_key
+        stamp_state.size_adjust = template.size_adjust
         stamp_state.anchor_corner = template.anchor_corner
         stamp_state.position_norm = template.position_norm
 
@@ -1456,9 +1478,16 @@ class PhotoMetadataEditor(QMainWindow):
         self.last_stamp_template = DateStampTemplate(
             color=stamp_state.color,
             font_key=stamp_state.font_key,
+            size_adjust=stamp_state.size_adjust,
             anchor_corner=stamp_state.anchor_corner,
             position_norm=position_norm,
         )
+
+    def _format_stamp_size_label(self, size_adjust: int) -> str:
+        """Format the stamp size offset for the popup."""
+        if size_adjust == 0:
+            return "Default"
+        return f"{size_adjust:+d}"
 
     def _sync_stamp_popup_from_state(self):
         """Update popup controls to match the current photo's stamp state."""
@@ -1472,6 +1501,7 @@ class PhotoMetadataEditor(QMainWindow):
             self.stamp_enabled_checkbox.setChecked(False)
             self.stamp_enabled_checkbox.blockSignals(False)
             self.stamp_text_entry.setText("")
+            self.stamp_size_label.setText("Default")
             self._set_stamp_popup_controls_enabled(False)
             return
 
@@ -1495,6 +1525,7 @@ class PhotoMetadataEditor(QMainWindow):
                 combo.setCurrentIndex(idx)
             combo.blockSignals(False)
 
+        self.stamp_size_label.setText(self._format_stamp_size_label(stamp_state.size_adjust))
         self._set_stamp_popup_controls_enabled(stamp_state.enabled)
 
     def toggle_stamp_settings_popup(self):
@@ -1599,6 +1630,21 @@ class PhotoMetadataEditor(QMainWindow):
     def on_stamp_font_changed(self, _index=None):
         """Handle stamp font changes."""
         self._update_stamp_style_from_popup(style_field="font_key", value=self.stamp_font_combo.currentData())
+
+    def adjust_stamp_font_size(self, direction: int):
+        """Increase or decrease the stamp font size in small steps."""
+        photo_path = self._current_photo_path()
+        if not photo_path or direction == 0:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        stamp_state.size_adjust = max(-6, min(12, stamp_state.size_adjust + int(direction)))
+        stamp_state.configured = True
+        self._update_last_stamp_template(stamp_state)
+        self._set_state_dirty(state)
+        self._sync_stamp_popup_from_state()
+        self.render_edit_preview()
 
     def _update_stamp_style_from_popup(self, style_field: str, value: Any):
         """Apply a simple stamp style field update and refresh preview."""

@@ -227,6 +227,7 @@ class TestImageEditing(unittest.TestCase):
         self.window.stamp_enabled_checkbox.setChecked(True)
         self.window.stamp_color_combo.setCurrentIndex(self.window.stamp_color_combo.findData("white"))
         self.window.stamp_font_combo.setCurrentIndex(self.window.stamp_font_combo.findData("courier_prime"))
+        self.window.adjust_stamp_font_size(2)
         self.window.on_stamp_rect_moved((0.88, 0.82, 0.98, 0.92))
         self.assertTrue(self.window.save_current_image_edits())
 
@@ -240,9 +241,28 @@ class TestImageEditing(unittest.TestCase):
         self.assertTrue(next_state.enabled)
         self.assertEqual(next_state.color, "white")
         self.assertEqual(next_state.font_key, "courier_prime")
+        self.assertEqual(next_state.size_adjust, 2)
         self.assertEqual(next_state.anchor_corner, "custom")
         self.assertAlmostEqual(next_state.position_norm[0], 0.88, places=2)
         self.assertAlmostEqual(next_state.position_norm[1], 0.82, places=2)
+
+    def test_stamp_size_controls_and_open_sans_option(self):
+        self.window.stamp_enabled_checkbox.setChecked(True)
+
+        font_keys = [
+            self.window.stamp_font_combo.itemData(i)
+            for i in range(self.window.stamp_font_combo.count())
+        ]
+        self.assertIn("open_sans", font_keys)
+
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.size_adjust, 0)
+        self.window.adjust_stamp_font_size(1)
+        self.assertEqual(state.size_adjust, 1)
+        self.assertEqual(self.window.stamp_size_label.text(), "+1")
+        self.window.adjust_stamp_font_size(-1)
+        self.assertEqual(state.size_adjust, 0)
+        self.assertEqual(self.window.stamp_size_label.text(), "Default")
 
     def test_stamp_corner_and_drag_positions_are_bounded(self):
         self.window.stamp_enabled_checkbox.setChecked(True)
