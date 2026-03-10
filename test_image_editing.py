@@ -17,7 +17,9 @@ try:
     from photo_metadata_editor_qt import (
         PhotoMetadataEditor,
         PhotoEditState,
+        DateStampState,
         apply_photo_adjustments,
+        apply_date_stamp_overlay,
         clamp_normalized_rect,
         normalized_rect_to_pixel_box,
     )
@@ -183,6 +185,92 @@ class TestImageEditing(unittest.TestCase):
             setattr(state, field_name, value)
             adjusted = apply_photo_adjustments(base, state, apply_crop=False)
             self.assertNotEqual(base.tobytes(), adjusted.tobytes(), msg=f"{field_name} did not change output")
+
+    def test_stamp_draft_does_not_modify_file_until_save(self):
+        before_bytes = open(self.photo1, "rb").read()
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        self.assertEqual(self.window.stamp_text_entry.text(), "January 01, 2024")
+        after_bytes = open(self.photo1, "rb").read()
+        self.assertEqual(before_bytes, after_bytes)
+
+    def test_stamp_save_changes_pixels_without_double_applying(self):
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        self.window.on_stamp_text_edited("JAN 01 2024")
+
+        before_bytes = open(self.photo1, "rb").read()
+        self.assertTrue(self.window.save_current_image_edits())
+        first_saved_bytes = open(self.photo1, "rb").read()
+        self.assertNotEqual(before_bytes, first_saved_bytes)
+
+        self.assertTrue(self.window.save_current_image_edits())
+        second_saved_bytes = open(self.photo1, "rb").read()
+        self.assertEqual(first_saved_bytes, second_saved_bytes)
+
+    def test_stamp_autofill_sync_and_manual_override(self):
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.text, "January 01, 2024")
+        self.assertEqual(state.text_mode, "auto_date")
+
+        self.window.date_entry.setText("February 02, 1999")
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.text, "February 02, 1999")
+        self.assertEqual(state.text_mode, "auto_date")
+
+        self.window.on_stamp_text_edited("Custom note")
+        self.window.date_entry.setText("March 03, 2003")
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.text, "Custom note")
+        self.assertEqual(state.text_mode, "manual")
+
+    def test_stamp_defaults_carry_forward_but_remain_disabled(self):
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        self.window.stamp_color_combo.setCurrentIndex(self.window.stamp_color_combo.findData("white"))
+        self.window.stamp_font_combo.setCurrentIndex(self.window.stamp_font_combo.findData("courier_prime"))
+        self.window.on_stamp_rect_moved((0.88, 0.82, 0.98, 0.92))
+        self.assertTrue(self.window.save_current_image_edits())
+
+        self.window._navigate_next()
+        next_state = self.window.get_or_create_edit_state(self.photo2).date_stamp
+        self.assertFalse(next_state.enabled)
+        self.assertEqual(next_state.text, "")
+
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        next_state = self.window.get_or_create_edit_state(self.photo2).date_stamp
+        self.assertTrue(next_state.enabled)
+        self.assertEqual(next_state.color, "white")
+        self.assertEqual(next_state.font_key, "courier_prime")
+        self.assertEqual(next_state.anchor_corner, "custom")
+        self.assertAlmostEqual(next_state.position_norm[0], 0.88, places=2)
+        self.assertAlmostEqual(next_state.position_norm[1], 0.82, places=2)
+
+    def test_stamp_corner_and_drag_positions_are_bounded(self):
+        self.window.stamp_enabled_checkbox.setChecked(True)
+        self.window.stamp_corner_combo.setCurrentIndex(self.window.stamp_corner_combo.findData("top_right"))
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.anchor_corner, "top_right")
+        self.assertIsNone(state.position_norm)
+
+        self.window.on_stamp_rect_moved((-0.4, 1.5, 0.2, 1.8))
+        state = self.window.get_or_create_edit_state(self.photo1).date_stamp
+        self.assertEqual(state.anchor_corner, "custom")
+        self.assertGreaterEqual(state.position_norm[0], 0.0)
+        self.assertLessEqual(state.position_norm[0], 1.0)
+        self.assertGreaterEqual(state.position_norm[1], 0.0)
+        self.assertLessEqual(state.position_norm[1], 1.0)
+
+    def test_orange_stamp_glow_differs_from_flat_colors(self):
+        base = Image.new("RGB", (300, 200), color=(20, 20, 20))
+        orange_state = DateStampState(enabled=True, text="13  9  9", color="orange")
+        white_state = DateStampState(enabled=True, text="13  9  9", color="white")
+        black_state = DateStampState(enabled=True, text="13  9  9", color="black")
+
+        orange_image, _ = apply_date_stamp_overlay(base, orange_state, self.window._stamp_font_for_pil)
+        white_image, _ = apply_date_stamp_overlay(base, white_state, self.window._stamp_font_for_pil)
+        black_image, _ = apply_date_stamp_overlay(base, black_state, self.window._stamp_font_for_pil)
+
+        self.assertNotEqual(orange_image.tobytes(), white_image.tobytes())
+        self.assertNotEqual(orange_image.tobytes(), black_image.tobytes())
 
 
 if __name__ == "__main__":

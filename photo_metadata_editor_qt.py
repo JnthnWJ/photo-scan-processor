@@ -13,27 +13,90 @@ import time
 import json
 import tempfile
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QScrollArea, QFrame, QSlider,
-    QComboBox,
+    QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QStatusBar, QToolBar, QSplitter, QInputDialog,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QEvent, QRectF
 from PySide6.QtGui import (
     QPixmap, QFont, QKeySequence, QShortcut, QAction, QImage,
-    QWheelEvent, QPainter, QTransform, QColor, QPen, QCursor
+    QWheelEvent, QPainter, QTransform, QColor, QPen, QCursor, QFontDatabase
 )
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageFilter
 import piexif
 from datetime import datetime
 from dateutil import parser as date_parser
 from geopy.geocoders import Nominatim
 import requests
+
+
+STAMP_FONT_FILES = OrderedDict([
+    ("ds_digital", ("DS Digital", "/Users/jonathanjensen/Downloads/ds_digital/DS-DIGI.TTF")),
+    ("courier_prime", ("Courier Prime", "/Users/jonathanjensen/Downloads/Courier_Prime/CourierPrime-Regular.ttf")),
+])
+
+STAMP_COLOR_VALUES = {
+    "white": (255, 255, 255),
+    "black": (16, 16, 16),
+    "orange": (255, 120, 24),
+}
+
+STAMP_CORNER_LABELS = OrderedDict([
+    ("bottom_left", "Bottom Left"),
+    ("bottom_right", "Bottom Right"),
+    ("top_left", "Top Left"),
+    ("top_right", "Top Right"),
+    ("custom", "Custom"),
+])
+
+
+def clamp_normalized_point(point_norm: Tuple[float, float]) -> Tuple[float, float]:
+    """Clamp a normalized x/y point to the image bounds."""
+    return (
+        max(0.0, min(1.0, float(point_norm[0]))),
+        max(0.0, min(1.0, float(point_norm[1]))),
+    )
+
+
+@dataclass
+class DateStampState:
+    """Draft state for an optional rasterized text stamp."""
+    enabled: bool = False
+    text: str = ""
+    text_mode: str = "auto_date"
+    color: str = "orange"
+    font_key: str = "ds_digital"
+    anchor_corner: str = "bottom_left"
+    position_norm: Optional[Tuple[float, float]] = None
+    configured: bool = False
+
+    def has_effective_changes(self) -> bool:
+        return self.enabled and bool(self.text.strip())
+
+
+@dataclass
+class DateStampTemplate:
+    """Session-level stamp style reused when enabling the next photo."""
+    color: str
+    font_key: str
+    anchor_corner: str
+    position_norm: Optional[Tuple[float, float]]
+
+
+@dataclass
+class DateStampLayout:
+    """Resolved stamp layout for preview/save rendering."""
+    text: str
+    font: Any
+    bbox_px: Tuple[int, int, int, int]
+    draw_position: Tuple[int, int]
+    font_size: int
 
 
 @dataclass
@@ -46,6 +109,7 @@ class PhotoEditState:
     tint: int = 0
     crop_rect_norm: Optional[Tuple[float, float, float, float]] = None
     crop_aspect: str = "freeform"
+    date_stamp: DateStampState = field(default_factory=DateStampState)
     is_dirty: bool = False
 
     def has_effective_changes(self) -> bool:
@@ -55,7 +119,8 @@ class PhotoEditState:
             self.saturation != 0,
             self.temperature != 0,
             self.tint != 0,
-            self.crop_rect_norm is not None
+            self.crop_rect_norm is not None,
+            self.date_stamp.has_effective_changes(),
         ])
 
 
@@ -159,10 +224,118 @@ def apply_photo_adjustments(
     return working
 
 
+def _load_stamp_font(font_resolver, font_key: str, font_size: int):
+    """Resolve a PIL font for the current stamp."""
+    font = font_resolver(font_key, font_size)
+    if font is not None:
+        return font
+
+    try:
+        return ImageFont.truetype("DejaVuSansMono.ttf", font_size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def resolve_date_stamp_layout(
+    image_size: Tuple[int, int],
+    stamp_state: DateStampState,
+    font_resolver,
+) -> Optional[DateStampLayout]:
+    """Compute text bounds and draw coordinates for a date stamp."""
+    text = (stamp_state.text or "").strip()
+    if not stamp_state.enabled or not text:
+        return None
+
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+
+    shorter_dimension = min(width, height)
+    font_size = max(12, int(shorter_dimension * 0.04))
+    margin = max(8, int(shorter_dimension * 0.03))
+    font = _load_stamp_font(font_resolver, stamp_state.font_key, font_size)
+
+    measure_image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    measure_draw = ImageDraw.Draw(measure_image)
+    text_bbox = measure_draw.textbbox((0, 0), text, font=font)
+    text_width = max(1, text_bbox[2] - text_bbox[0])
+    text_height = max(1, text_bbox[3] - text_bbox[1])
+
+    if stamp_state.anchor_corner == "custom" and stamp_state.position_norm:
+        norm_x, norm_y = clamp_normalized_point(stamp_state.position_norm)
+        left = int(round(norm_x * width))
+        top = int(round(norm_y * height))
+    elif stamp_state.anchor_corner == "bottom_right":
+        left = width - text_width - margin
+        top = height - text_height - margin
+    elif stamp_state.anchor_corner == "top_left":
+        left = margin
+        top = margin
+    elif stamp_state.anchor_corner == "top_right":
+        left = width - text_width - margin
+        top = margin
+    else:
+        left = margin
+        top = height - text_height - margin
+
+    left = max(0, min(width - text_width, left))
+    top = max(0, min(height - text_height, top))
+    draw_position = (left - text_bbox[0], top - text_bbox[1])
+    return DateStampLayout(
+        text=text,
+        font=font,
+        bbox_px=(left, top, left + text_width, top + text_height),
+        draw_position=draw_position,
+        font_size=font_size,
+    )
+
+
+def apply_date_stamp_overlay(
+    image: Image.Image,
+    stamp_state: DateStampState,
+    font_resolver,
+) -> Tuple[Image.Image, Optional[Tuple[int, int, int, int]]]:
+    """Apply a date stamp overlay and return its pixel bounds."""
+    layout = resolve_date_stamp_layout(image.size, stamp_state, font_resolver)
+    if not layout:
+        return image.copy(), None
+
+    working = image.convert("RGBA")
+    alpha_mask = Image.new("L", working.size, 0)
+    mask_draw = ImageDraw.Draw(alpha_mask)
+    mask_draw.text(layout.draw_position, layout.text, fill=255, font=layout.font)
+
+    if stamp_state.color == "orange":
+        far_glow = alpha_mask.filter(ImageFilter.GaussianBlur(radius=max(3, layout.font_size * 0.22)))
+        near_glow = alpha_mask.filter(ImageFilter.GaussianBlur(radius=max(2, layout.font_size * 0.12)))
+
+        far_layer = Image.new("RGBA", working.size, (255, 70, 0, 0))
+        far_layer.putalpha(far_glow.point(lambda px: min(255, int(px * 0.35))))
+        working = Image.alpha_composite(working, far_layer)
+
+        near_layer = Image.new("RGBA", working.size, (255, 130, 0, 0))
+        near_layer.putalpha(near_glow.point(lambda px: min(255, int(px * 0.7))))
+        working = Image.alpha_composite(working, near_layer)
+
+        text_layer = Image.new("RGBA", working.size, (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_layer)
+        text_draw.text(layout.draw_position, layout.text, fill=(255, 164, 40, 255), font=layout.font)
+        working = Image.alpha_composite(working, text_layer)
+    else:
+        text_color = STAMP_COLOR_VALUES.get(stamp_state.color, STAMP_COLOR_VALUES["white"])
+        text_layer = Image.new("RGBA", working.size, (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_layer)
+        text_draw.text(layout.draw_position, layout.text, fill=(*text_color, 255), font=layout.font)
+        working = Image.alpha_composite(working, text_layer)
+
+    return working.convert("RGB"), layout.bbox_px
+
+
 class ZoomableImageViewer(QGraphicsView):
     """A zoomable and pannable image viewer widget."""
     cropChanged = Signal(object)
     cropModeChanged = Signal(bool)
+    stampMoved = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -202,6 +375,10 @@ class ZoomableImageViewer(QGraphicsView):
         self._crop_active_handle = None
         self._crop_min_size = 20.0
         self._handle_size = 12.0
+        self.stamp_rect_scene: Optional[QRectF] = None
+        self.stamp_drag_enabled = False
+        self._stamp_drag_mode = False
+        self._stamp_drag_offset = None
 
     def set_image(self, pixmap: QPixmap):
         """Set the image to display."""
@@ -229,6 +406,10 @@ class ZoomableImageViewer(QGraphicsView):
         self.has_image = False
         self.crop_rect_scene = None
         self.crop_mode_enabled = False
+        self.stamp_rect_scene = None
+        self.stamp_drag_enabled = False
+        self._stamp_drag_mode = False
+        self._stamp_drag_offset = None
         self.viewport().unsetCursor()
 
     def _scene_image_rect(self) -> Optional[QRectF]:
@@ -387,6 +568,36 @@ class ZoomableImageViewer(QGraphicsView):
         if not self.crop_rect_scene:
             return None
         return self._scene_rect_to_normalized(self.crop_rect_scene)
+
+    def set_stamp_rect_normalized(self, rect_norm: Optional[Tuple[float, float, float, float]]):
+        """Set the draggable stamp bounds from normalized coordinates."""
+        if not rect_norm:
+            self.stamp_rect_scene = None
+            self.viewport().update()
+            return
+
+        rect = self._normalized_to_scene_rect(rect_norm)
+        self.stamp_rect_scene = rect.normalized() if rect else None
+        self.viewport().update()
+
+    def set_stamp_drag_enabled(self, enabled: bool):
+        """Enable stamp dragging when preview has a visible stamp."""
+        self.stamp_drag_enabled = enabled
+        if not enabled:
+            self._stamp_drag_mode = False
+            self._stamp_drag_offset = None
+        self.viewport().update()
+
+    def _clamp_stamp_rect(self, rect: QRectF) -> Optional[QRectF]:
+        image_rect = self._scene_image_rect()
+        if not image_rect:
+            return None
+
+        width = max(1.0, min(rect.width(), image_rect.width()))
+        height = max(1.0, min(rect.height(), image_rect.height()))
+        left = max(image_rect.left(), min(rect.left(), image_rect.right() - width))
+        top = max(image_rect.top(), min(rect.top(), image_rect.bottom() - height))
+        return QRectF(left, top, width, height)
 
     def drawForeground(self, painter: QPainter, rect: QRectF):
         """Draw crop overlay."""
@@ -549,6 +760,23 @@ class ZoomableImageViewer(QGraphicsView):
             event.accept()
             return
 
+        if (
+            not self.crop_mode_enabled
+            and self.stamp_drag_enabled
+            and self.stamp_rect_scene
+            and event.button() == Qt.LeftButton
+        ):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self.stamp_rect_scene.contains(scene_pos):
+                self._stamp_drag_mode = True
+                self._stamp_drag_offset = (
+                    scene_pos.x() - self.stamp_rect_scene.left(),
+                    scene_pos.y() - self.stamp_rect_scene.top(),
+                )
+                self.viewport().setCursor(QCursor(Qt.SizeAllCursor))
+                event.accept()
+                return
+
         if event.button() == Qt.MiddleButton:
             # Middle click to fit to window
             self.fit_to_window()
@@ -567,13 +795,20 @@ class ZoomableImageViewer(QGraphicsView):
             event.accept()
             return
 
+        if self._stamp_drag_mode and event.button() == Qt.LeftButton:
+            self._stamp_drag_mode = False
+            self._stamp_drag_offset = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+
         if event.button() == Qt.LeftButton:
             self.setDragMode(QGraphicsView.RubberBandDrag)
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):
         """Handle crop interactions and cursor updates."""
-        if not self.crop_mode_enabled or not self.has_image:
+        if not self.has_image:
             super().mouseMoveEvent(event)
             return
 
@@ -583,21 +818,35 @@ class ZoomableImageViewer(QGraphicsView):
             super().mouseMoveEvent(event)
             return
 
-        if self._crop_drag_mode == "move" and self._crop_start_rect and self._crop_start_scene_pos:
+        if self.crop_mode_enabled and self._crop_drag_mode == "move" and self._crop_start_rect and self._crop_start_scene_pos:
             delta = scene_pos - self._crop_start_scene_pos
             moved_rect = self._crop_start_rect.translated(delta.x(), delta.y())
             self._set_crop_rect_scene(moved_rect, emit_signal=True)
             event.accept()
             return
 
-        if self._crop_drag_mode == "resize" and self._crop_active_handle:
+        if self._stamp_drag_mode and self.stamp_rect_scene and self._stamp_drag_offset:
+            new_left = scene_pos.x() - self._stamp_drag_offset[0]
+            new_top = scene_pos.y() - self._stamp_drag_offset[1]
+            moved_rect = QRectF(new_left, new_top, self.stamp_rect_scene.width(), self.stamp_rect_scene.height())
+            clamped_rect = self._clamp_stamp_rect(moved_rect)
+            if clamped_rect:
+                self.stamp_rect_scene = clamped_rect
+                rect_norm = self._scene_rect_to_normalized(clamped_rect)
+                if rect_norm:
+                    self.stampMoved.emit(rect_norm)
+                self.viewport().update()
+            event.accept()
+            return
+
+        if self.crop_mode_enabled and self._crop_drag_mode == "resize" and self._crop_active_handle:
             resized_rect = self._resize_from_handle(self._crop_active_handle, scene_pos)
             if resized_rect:
                 self._set_crop_rect_scene(resized_rect, emit_signal=True)
             event.accept()
             return
 
-        if self._crop_drag_mode == "create" and self._crop_start_scene_pos:
+        if self.crop_mode_enabled and self._crop_drag_mode == "create" and self._crop_start_scene_pos:
             start = self._crop_start_scene_pos
             new_rect = QRectF(start.x(), start.y(), scene_pos.x() - start.x(), scene_pos.y() - start.y()).normalized()
             if self.crop_aspect_ratio and self.crop_aspect_ratio > 0:
@@ -622,13 +871,15 @@ class ZoomableImageViewer(QGraphicsView):
             event.accept()
             return
 
-        handle = self._hit_test_handle(scene_pos)
+        handle = self._hit_test_handle(scene_pos) if self.crop_mode_enabled else None
         if handle:
             self.viewport().setCursor(QCursor(Qt.SizeAllCursor))
-        elif self.crop_rect_scene and self.crop_rect_scene.contains(scene_pos):
+        elif self.crop_mode_enabled and self.crop_rect_scene and self.crop_rect_scene.contains(scene_pos):
             self.viewport().setCursor(QCursor(Qt.OpenHandCursor))
+        elif (not self.crop_mode_enabled) and self.stamp_drag_enabled and self.stamp_rect_scene and self.stamp_rect_scene.contains(scene_pos):
+            self.viewport().setCursor(QCursor(Qt.SizeAllCursor))
         else:
-            self.viewport().setCursor(QCursor(Qt.CrossCursor))
+            self.viewport().unsetCursor()
 
         super().mouseMoveEvent(event)
 
@@ -690,6 +941,7 @@ class PhotoMetadataEditor(QMainWindow):
         # Non-destructive image edit state
         self.photo_edit_states: Dict[str, PhotoEditState] = {}
         self.last_crop_template: Optional[CropTemplate] = None
+        self.last_stamp_template: Optional[DateStampTemplate] = None
         self.active_adjustment: Optional[str] = None
         self.crop_aspect_options = OrderedDict([
             ("freeform", ("Freeform", None)),
@@ -750,6 +1002,8 @@ class PhotoMetadataEditor(QMainWindow):
         self.recent_date_values = []
         self.recent_location_values = []
         self.load_recent_values()
+        self.stamp_font_families: Dict[str, Optional[str]] = {}
+        self.register_stamp_fonts()
 
         # Initialize UI
         self.setup_ui()
@@ -779,6 +1033,9 @@ class PhotoMetadataEditor(QMainWindow):
         
         # Create metadata panel (right side)
         self.create_metadata_panel(main_splitter)
+
+        # Create the stamp settings popup after the controls it anchors to exist.
+        self.create_stamp_settings_popup()
         
         # Set splitter proportions (2:1 ratio)
         main_splitter.setSizes([800, 400])
@@ -835,6 +1092,7 @@ class PhotoMetadataEditor(QMainWindow):
         self.photo_viewer = ZoomableImageViewer()
         self.photo_viewer.setMinimumSize(400, 300)
         self.photo_viewer.cropChanged.connect(self.on_crop_rect_changed)
+        self.photo_viewer.stampMoved.connect(self.on_stamp_rect_moved)
         photo_layout.addWidget(self.photo_viewer)
 
         # Edit controls under the image viewer
@@ -964,11 +1222,102 @@ class PhotoMetadataEditor(QMainWindow):
         self.rotate_right_btn.setEnabled(False)  # Disabled until image is loaded
         rotation_layout.addWidget(self.rotate_right_btn)
 
-        # Add some spacing to the right
+        self.date_stamp_btn = QPushButton("Date Stamp")
+        self.date_stamp_btn.setToolTip("Configure an optional text stamp overlay")
+        self.date_stamp_btn.setEnabled(False)
+        self.date_stamp_btn.clicked.connect(self.toggle_stamp_settings_popup)
+        rotation_layout.addWidget(self.date_stamp_btn)
+
         rotation_layout.addStretch()
 
         # Add the rotation layout to the parent
         parent_layout.addLayout(rotation_layout)
+
+    def create_stamp_settings_popup(self):
+        """Create the anchored popup used to configure the date stamp."""
+        self.stamp_settings_popup = QFrame(self, Qt.Popup | Qt.FramelessWindowHint)
+        self.stamp_settings_popup.setObjectName("stampSettingsPopup")
+        self.stamp_settings_popup.setFrameStyle(QFrame.StyledPanel)
+        self.stamp_settings_popup.setStyleSheet(
+            "QFrame#stampSettingsPopup { background: #232323; border: 1px solid #4a4a4a; border-radius: 8px; }"
+            "QLabel { color: #f3f3f3; }"
+            "QCheckBox { color: #f3f3f3; }"
+        )
+        popup_layout = QVBoxLayout(self.stamp_settings_popup)
+        popup_layout.setContentsMargins(12, 12, 12, 12)
+        popup_layout.setSpacing(8)
+
+        title_label = QLabel("Date Stamp")
+        title_font = QFont()
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        popup_layout.addWidget(title_label)
+
+        self.stamp_enabled_checkbox = QCheckBox("Enabled")
+        self.stamp_enabled_checkbox.toggled.connect(self.on_stamp_enabled_toggled)
+        popup_layout.addWidget(self.stamp_enabled_checkbox)
+
+        popup_layout.addWidget(QLabel("Text"))
+        self.stamp_text_entry = QLineEdit()
+        self.stamp_text_entry.setPlaceholderText("Enter stamp text")
+        self.stamp_text_entry.textEdited.connect(self.on_stamp_text_edited)
+        popup_layout.addWidget(self.stamp_text_entry)
+
+        popup_layout.addWidget(QLabel("Color"))
+        self.stamp_color_combo = QComboBox()
+        self.stamp_color_combo.addItem("Orange", "orange")
+        self.stamp_color_combo.addItem("White", "white")
+        self.stamp_color_combo.addItem("Black", "black")
+        self.stamp_color_combo.currentIndexChanged.connect(self.on_stamp_color_changed)
+        popup_layout.addWidget(self.stamp_color_combo)
+
+        popup_layout.addWidget(QLabel("Corner"))
+        self.stamp_corner_combo = QComboBox()
+        for corner_key, label in STAMP_CORNER_LABELS.items():
+            self.stamp_corner_combo.addItem(label, corner_key)
+        self.stamp_corner_combo.currentIndexChanged.connect(self.on_stamp_corner_changed)
+        popup_layout.addWidget(self.stamp_corner_combo)
+
+        popup_layout.addWidget(QLabel("Font"))
+        self.stamp_font_combo = QComboBox()
+        for font_key, (label, _) in STAMP_FONT_FILES.items():
+            self.stamp_font_combo.addItem(label, font_key)
+        self.stamp_font_combo.currentIndexChanged.connect(self.on_stamp_font_changed)
+        popup_layout.addWidget(self.stamp_font_combo)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.stamp_reset_position_btn = QPushButton("Reset Position")
+        self.stamp_reset_position_btn.clicked.connect(self.reset_stamp_position)
+        button_row.addWidget(self.stamp_reset_position_btn)
+        popup_layout.addLayout(button_row)
+
+        self._set_stamp_popup_controls_enabled(False)
+
+    def _set_stamp_popup_controls_enabled(self, enabled: bool):
+        """Enable or disable stamp configuration controls except the main toggle."""
+        for widget in [
+            self.stamp_text_entry,
+            self.stamp_color_combo,
+            self.stamp_corner_combo,
+            self.stamp_font_combo,
+            self.stamp_reset_position_btn,
+        ]:
+            widget.setEnabled(enabled)
+
+    def register_stamp_fonts(self):
+        """Register bundled stamp fonts for Qt controls and remember availability."""
+        for font_key, (_label, font_path) in STAMP_FONT_FILES.items():
+            family_name = None
+            if os.path.exists(font_path):
+                try:
+                    font_id = QFontDatabase.addApplicationFont(font_path)
+                    if font_id != -1:
+                        families = QFontDatabase.applicationFontFamilies(font_id)
+                        family_name = families[0] if families else None
+                except Exception:
+                    family_name = None
+            self.stamp_font_families[font_key] = family_name
 
     def _set_edit_controls_enabled(self, enabled: bool):
         """Enable or disable all image edit controls."""
@@ -1021,6 +1370,286 @@ class PhotoMetadataEditor(QMainWindow):
             self.crop_aspect_combo.blockSignals(True)
             self.crop_aspect_combo.setCurrentIndex(idx)
             self.crop_aspect_combo.blockSignals(False)
+
+    def _stamp_font_for_pil(self, font_key: str, font_size: int):
+        """Resolve the preferred PIL font for rendering the date stamp."""
+        font_path = STAMP_FONT_FILES.get(font_key, ("", ""))[1]
+        if font_path and os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, font_size)
+            except Exception:
+                pass
+
+        fallback_family = self.stamp_font_families.get(font_key)
+        if fallback_family:
+            try:
+                return ImageFont.truetype(fallback_family, font_size)
+            except Exception:
+                pass
+
+        return None
+
+    def _normalized_bbox_from_pixels(
+        self, bbox_px: Optional[Tuple[int, int, int, int]], image_size: Tuple[int, int]
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if not bbox_px or image_size[0] <= 0 or image_size[1] <= 0:
+            return None
+        left, top, right, bottom = bbox_px
+        width, height = image_size
+        return clamp_normalized_rect((left / width, top / height, right / width, bottom / height))
+
+    def _apply_manual_rotation_to_image(self, image: Image.Image) -> Image.Image:
+        """Apply the current preview rotation to a PIL image."""
+        if self.manual_rotation == 90:
+            return image.transpose(Image.Transpose.ROTATE_270)
+        if self.manual_rotation == 180:
+            return image.transpose(Image.Transpose.ROTATE_180)
+        if self.manual_rotation == 270:
+            return image.transpose(Image.Transpose.ROTATE_90)
+        return image
+
+    def _build_rendered_image(
+        self,
+        source_image: Image.Image,
+        state: PhotoEditState,
+        apply_crop: bool,
+        preview_max_dimension: Optional[int],
+    ) -> Tuple[Image.Image, Optional[Tuple[float, float, float, float]]]:
+        """Render a preview/save image using the same edit pipeline as persistence."""
+        rendered = apply_photo_adjustments(
+            source_image,
+            state,
+            apply_crop=apply_crop,
+            preview_max_dimension=preview_max_dimension,
+        )
+        rendered = self._apply_manual_rotation_to_image(rendered)
+        rendered, stamp_bbox = apply_date_stamp_overlay(rendered, state.date_stamp, self._stamp_font_for_pil)
+        return rendered, self._normalized_bbox_from_pixels(stamp_bbox, rendered.size)
+
+    def _default_stamp_template(self) -> DateStampTemplate:
+        """Return the fallback stamp template used before the user customizes one."""
+        return DateStampTemplate(
+            color="orange",
+            font_key="ds_digital",
+            anchor_corner="bottom_left",
+            position_norm=None,
+        )
+
+    def _current_date_stamp_text(self) -> str:
+        """Return the visible metadata date string used for auto-fill."""
+        return self.date_entry.text().strip() if hasattr(self, "date_entry") else ""
+
+    def _apply_template_to_stamp(self, stamp_state: DateStampState):
+        """Initialize a photo's stamp settings from the last session template."""
+        template = self.last_stamp_template or self._default_stamp_template()
+        stamp_state.color = template.color
+        stamp_state.font_key = template.font_key
+        stamp_state.anchor_corner = template.anchor_corner
+        stamp_state.position_norm = template.position_norm
+
+    def _update_last_stamp_template(self, stamp_state: DateStampState):
+        """Persist the active stamp's style/position for newly enabled photos."""
+        if stamp_state.anchor_corner == "custom" and stamp_state.position_norm:
+            position_norm = clamp_normalized_point(stamp_state.position_norm)
+        else:
+            position_norm = None
+        self.last_stamp_template = DateStampTemplate(
+            color=stamp_state.color,
+            font_key=stamp_state.font_key,
+            anchor_corner=stamp_state.anchor_corner,
+            position_norm=position_norm,
+        )
+
+    def _sync_stamp_popup_from_state(self):
+        """Update popup controls to match the current photo's stamp state."""
+        photo_path = self._current_photo_path()
+        has_photo = bool(photo_path and self.current_image)
+        if not hasattr(self, "stamp_enabled_checkbox"):
+            return
+
+        if not has_photo:
+            self.stamp_enabled_checkbox.blockSignals(True)
+            self.stamp_enabled_checkbox.setChecked(False)
+            self.stamp_enabled_checkbox.blockSignals(False)
+            self.stamp_text_entry.setText("")
+            self._set_stamp_popup_controls_enabled(False)
+            return
+
+        stamp_state = self.get_or_create_edit_state(photo_path).date_stamp
+        self.stamp_enabled_checkbox.blockSignals(True)
+        self.stamp_enabled_checkbox.setChecked(stamp_state.enabled)
+        self.stamp_enabled_checkbox.blockSignals(False)
+
+        self.stamp_text_entry.blockSignals(True)
+        self.stamp_text_entry.setText(stamp_state.text)
+        self.stamp_text_entry.blockSignals(False)
+
+        for combo, value in [
+            (self.stamp_color_combo, stamp_state.color),
+            (self.stamp_corner_combo, stamp_state.anchor_corner),
+            (self.stamp_font_combo, stamp_state.font_key),
+        ]:
+            combo.blockSignals(True)
+            idx = combo.findData(value)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+        self._set_stamp_popup_controls_enabled(stamp_state.enabled)
+
+    def toggle_stamp_settings_popup(self):
+        """Show or hide the date stamp settings popup."""
+        if self.stamp_settings_popup.isVisible():
+            self.stamp_settings_popup.hide()
+            return
+
+        self._sync_stamp_popup_from_state()
+        popup_pos = self.date_stamp_btn.mapToGlobal(self.date_stamp_btn.rect().bottomLeft())
+        self.stamp_settings_popup.adjustSize()
+        self.stamp_settings_popup.move(popup_pos.x(), popup_pos.y() + 6)
+        self.stamp_settings_popup.show()
+        self.stamp_settings_popup.raise_()
+
+    def _ensure_stamp_initialized_for_photo(self, stamp_state: DateStampState):
+        """Apply last-used style defaults the first time a photo enables stamping."""
+        if not stamp_state.configured:
+            self._apply_template_to_stamp(stamp_state)
+            stamp_state.configured = True
+
+    def _sync_current_stamp_from_date_entry(self, render_preview: bool = True):
+        """Keep auto-date stamp text synced with the visible metadata date entry."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        if stamp_state.text_mode != "auto_date" or not stamp_state.enabled:
+            return
+
+        new_text = self._current_date_stamp_text()
+        if stamp_state.text != new_text:
+            stamp_state.text = new_text
+            self._set_state_dirty(state)
+            self._sync_stamp_popup_from_state()
+            if render_preview and self.current_image:
+                self.preview_render_timer.start(35)
+
+    def on_stamp_enabled_toggled(self, enabled: bool):
+        """Enable or disable the current photo's date stamp."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            self.stamp_enabled_checkbox.blockSignals(True)
+            self.stamp_enabled_checkbox.setChecked(False)
+            self.stamp_enabled_checkbox.blockSignals(False)
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        if enabled:
+            self._ensure_stamp_initialized_for_photo(stamp_state)
+            stamp_state.enabled = True
+            stamp_state.text_mode = "auto_date"
+            stamp_state.text = self._current_date_stamp_text()
+            self._update_last_stamp_template(stamp_state)
+        else:
+            stamp_state.enabled = False
+        self._set_state_dirty(state)
+        self._sync_stamp_popup_from_state()
+        self.render_edit_preview()
+
+    def on_stamp_text_edited(self, text: str):
+        """Persist manual stamp text edits and break metadata date sync."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        stamp_state.text = text
+        stamp_state.text_mode = "manual"
+        stamp_state.configured = True
+        self._set_state_dirty(state)
+        self.render_edit_preview()
+
+    def on_stamp_color_changed(self, _index=None):
+        """Handle stamp color changes."""
+        self._update_stamp_style_from_popup(style_field="color", value=self.stamp_color_combo.currentData())
+
+    def on_stamp_corner_changed(self, _index=None):
+        """Handle corner snapping changes from the popup."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        corner = self.stamp_corner_combo.currentData()
+        if not corner:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        if corner != "custom":
+            stamp_state.anchor_corner = corner
+            stamp_state.position_norm = None
+            stamp_state.configured = True
+            self._update_last_stamp_template(stamp_state)
+            self._set_state_dirty(state)
+            self.render_edit_preview()
+
+    def on_stamp_font_changed(self, _index=None):
+        """Handle stamp font changes."""
+        self._update_stamp_style_from_popup(style_field="font_key", value=self.stamp_font_combo.currentData())
+
+    def _update_stamp_style_from_popup(self, style_field: str, value: Any):
+        """Apply a simple stamp style field update and refresh preview."""
+        photo_path = self._current_photo_path()
+        if not photo_path or value is None:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        setattr(stamp_state, style_field, value)
+        stamp_state.configured = True
+        self._update_last_stamp_template(stamp_state)
+        self._set_state_dirty(state)
+        self.render_edit_preview()
+
+    def reset_stamp_position(self):
+        """Reset stamp placement back to a snapped corner position."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        target_corner = self.stamp_corner_combo.currentData()
+        if target_corner == "custom" or not target_corner:
+            target_corner = "bottom_left"
+
+        stamp_state.anchor_corner = target_corner
+        stamp_state.position_norm = None
+        stamp_state.configured = True
+        self._update_last_stamp_template(stamp_state)
+        self._set_state_dirty(state)
+        self._sync_stamp_popup_from_state()
+        self.render_edit_preview()
+
+    def on_stamp_rect_moved(self, rect_norm):
+        """Persist free-drag stamp movement from the image viewer."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        left, top, _right, _bottom = clamp_normalized_rect(tuple(rect_norm))
+        state = self.get_or_create_edit_state(photo_path)
+        stamp_state = state.date_stamp
+        stamp_state.anchor_corner = "custom"
+        stamp_state.position_norm = clamp_normalized_point((left, top))
+        stamp_state.configured = True
+        self._update_last_stamp_template(stamp_state)
+        self._set_state_dirty(state)
+        self._sync_stamp_popup_from_state()
+        self.preview_render_timer.start(15)
 
     def set_active_adjustment(self, control_name: Optional[str]):
         """Activate one slider-driven adjustment control at a time."""
@@ -1172,7 +1801,7 @@ class PhotoMetadataEditor(QMainWindow):
             return
 
         state = self.get_or_create_edit_state(photo_path)
-        preview_image = apply_photo_adjustments(
+        preview_image, stamp_bbox_norm = self._build_rendered_image(
             self.current_image,
             state,
             apply_crop=not self.photo_viewer.crop_mode_enabled,
@@ -1180,12 +1809,11 @@ class PhotoMetadataEditor(QMainWindow):
         )
         preview_pixmap = self._pil_to_qpixmap(preview_image)
 
-        if self.manual_rotation != 0:
-            transform = QTransform()
-            transform.rotate(self.manual_rotation)
-            preview_pixmap = preview_pixmap.transformed(transform, Qt.SmoothTransformation)
-
         self.photo_viewer.set_image(preview_pixmap)
+        self.photo_viewer.set_stamp_rect_normalized(stamp_bbox_norm)
+        self.photo_viewer.set_stamp_drag_enabled(
+            bool(stamp_bbox_norm and state.date_stamp.enabled and not self.photo_viewer.crop_mode_enabled)
+        )
 
         if self.photo_viewer.crop_mode_enabled:
             self.photo_viewer.set_crop_aspect_ratio(self._aspect_ratio_for_key(state.crop_aspect))
@@ -1291,19 +1919,12 @@ class PhotoMetadataEditor(QMainWindow):
             except Exception:
                 pass
 
-            edited_image = apply_photo_adjustments(
+            edited_image, _stamp_bbox_norm = self._build_rendered_image(
                 self.current_image,
                 state,
                 apply_crop=True,
                 preview_max_dimension=None,
             )
-
-            if self.manual_rotation == 90:
-                edited_image = edited_image.transpose(Image.Transpose.ROTATE_270)
-            elif self.manual_rotation == 180:
-                edited_image = edited_image.transpose(Image.Transpose.ROTATE_180)
-            elif self.manual_rotation == 270:
-                edited_image = edited_image.transpose(Image.Transpose.ROTATE_90)
 
             save_kwargs = {"exif": exif_bytes}
             if icc_profile:
@@ -1328,6 +1949,7 @@ class PhotoMetadataEditor(QMainWindow):
             self.adjustment_panel.hide()
             self.crop_panel.hide()
             self.crop_btn.setText("Crop")
+            self._sync_stamp_popup_from_state()
             self.render_edit_preview()
             self.update_status("✓ Image edits saved")
             return True
@@ -1348,6 +1970,7 @@ class PhotoMetadataEditor(QMainWindow):
         self.active_adjustment = None
         self.adjustment_panel.hide()
         self.exit_crop_mode(apply_preview=False)
+        self._sync_stamp_popup_from_state()
         self.render_edit_preview()
         self.update_status("Draft image edits discarded")
         return True
@@ -1363,6 +1986,7 @@ class PhotoMetadataEditor(QMainWindow):
         self.adjustment_panel.hide()
         self.exit_crop_mode(apply_preview=False)
         self._set_crop_combo_value("freeform")
+        self._sync_stamp_popup_from_state()
         self.render_edit_preview()
 
     def create_metadata_panel(self, parent):
@@ -2173,6 +2797,7 @@ The application creates backup files (.backup) before modifying originals."""
             # Enable rotation buttons
             self.rotate_left_btn.setEnabled(True)
             self.rotate_right_btn.setEnabled(True)
+            self.date_stamp_btn.setEnabled(True)
             self._set_edit_controls_enabled(True)
 
             # Close crop mode/slider when switching photos
@@ -2200,6 +2825,7 @@ The application creates backup files (.backup) before modifying originals."""
             # Update copy button state
             self.update_copy_button_state()
             self.update_tagging_ui()
+            self._sync_stamp_popup_from_state()
 
             # Preload adjacent images in background
             self._preload_adjacent_images()
@@ -2227,12 +2853,16 @@ The application creates backup files (.backup) before modifying originals."""
         if hasattr(self, 'rotate_left_btn'):
             self.rotate_left_btn.setEnabled(False)
             self.rotate_right_btn.setEnabled(False)
+            self.date_stamp_btn.setEnabled(False)
             self.rotation_label.setText("0°")
         if hasattr(self, 'brightness_btn'):
             self._set_edit_controls_enabled(False)
             self.adjustment_panel.hide()
             self.crop_panel.hide()
             self.crop_btn.setText("Crop")
+        if hasattr(self, 'stamp_settings_popup'):
+            self.stamp_settings_popup.hide()
+            self._sync_stamp_popup_from_state()
         if hasattr(self, 'tag_entry'):
             self.update_tagging_ui()
 
@@ -2635,6 +3265,10 @@ The application creates backup files (.backup) before modifying originals."""
             self.date_entry.textChanged.connect(self.on_date_change)
             self.caption_text.textChanged.connect(self.on_caption_change)
             self.location_entry.textChanged.connect(self.on_location_change)
+            self._sync_current_stamp_from_date_entry(render_preview=False)
+            self._sync_stamp_popup_from_state()
+            if self._current_photo_path() and self.current_image:
+                self.render_edit_preview()
 
             # Show recent values for empty fields
             if not self.date_entry.text().strip():
@@ -2730,18 +3364,21 @@ The application creates backup files (.backup) before modifying originals."""
             return
 
         date_text = self.date_entry.text().strip()
+        self._sync_current_stamp_from_date_entry(render_preview=False)
         if not date_text:
             # Clear date from EXIF if empty
             self.schedule_metadata_save('date', None)
             self.hide_date_preview()
             # Show recent values when field is empty
             self.show_date_recent_values()
+            self.preview_render_timer.start(35)
             return
 
         # Hide recent values when user is typing
         self.hide_date_recent_values()
         # Show real-time preview (but don't change the field content or auto-save)
         self.show_date_preview(date_text)
+        self.preview_render_timer.start(35)
 
     def show_date_preview(self, date_text):
         """Show date preview dropdown."""
@@ -2878,6 +3515,7 @@ The application creates backup files (.backup) before modifying originals."""
             self.add_recent_date_value(formatted_date)
             # Save the date immediately
             self.save_date_immediately(parsed_date)
+            self._sync_current_stamp_from_date_entry(render_preview=True)
 
     def parse_natural_date(self, date_text):
         """Parse natural language date input."""
