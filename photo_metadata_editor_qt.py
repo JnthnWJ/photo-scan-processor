@@ -971,6 +971,7 @@ class PhotoMetadataEditor(QMainWindow):
         self._last_navigation_time = 0
         self._navigation_debounce_ms = 50  # 50ms debounce
         self._pending_direction = None
+        self._navigation_in_progress = False
         self._navigation_timer = QTimer()
         self._navigation_timer.setSingleShot(True)
         self._navigation_timer.timeout.connect(self._execute_navigation)
@@ -2999,14 +3000,18 @@ The application creates backup files (.backup) before modifying originals."""
             if not self._resolve_unsaved_image_edits_before_navigation():
                 return
 
-            # Save any pending changes before navigating to prevent data loss
-            self._save_pending_changes_before_navigation()
+            self._navigation_in_progress = True
+            try:
+                # Save any pending changes before navigating to prevent data loss
+                self._save_pending_changes_before_navigation()
 
-            # Store current photo metadata for "Copy from Previous" feature
-            self.store_current_photo_metadata()
+                # Store current photo metadata for "Copy from Previous" feature
+                self.store_current_photo_metadata()
 
-            self.current_photo_index -= 1
-            self.load_current_photo()
+                self.current_photo_index -= 1
+                self.load_current_photo()
+            finally:
+                self._navigation_in_progress = False
         else:
             self.update_status("Already at first photo")
 
@@ -3019,14 +3024,18 @@ The application creates backup files (.backup) before modifying originals."""
             if not self._resolve_unsaved_image_edits_before_navigation():
                 return
 
-            # Save any pending changes before navigating to prevent data loss
-            self._save_pending_changes_before_navigation()
+            self._navigation_in_progress = True
+            try:
+                # Save any pending changes before navigating to prevent data loss
+                self._save_pending_changes_before_navigation()
 
-            # Store current photo metadata for "Copy from Previous" feature
-            self.store_current_photo_metadata()
+                # Store current photo metadata for "Copy from Previous" feature
+                self.store_current_photo_metadata()
 
-            self.current_photo_index += 1
-            self.load_current_photo()
+                self.current_photo_index += 1
+                self.load_current_photo()
+            finally:
+                self._navigation_in_progress = False
         else:
             self.update_status("Already at last photo")
 
@@ -3511,6 +3520,10 @@ The application creates backup files (.backup) before modifying originals."""
 
     def on_date_focus_out(self):
         """Handle date field losing focus."""
+        if self._navigation_in_progress:
+            QTimer.singleShot(100, self.hide_date_preview)
+            return
+
         date_text = self.date_entry.text().strip()
         if date_text:
             parsed_date = self.parse_natural_date(date_text)

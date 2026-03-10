@@ -68,6 +68,12 @@ class TestImageEditing(unittest.TestCase):
         }
         img.save(path, quality=95, exif=piexif.dump(exif_dict))
 
+    def _clear_photo_date(self, path):
+        exif_dict = piexif.load(path)
+        exif_dict.setdefault("Exif", {}).pop(piexif.ExifIFD.DateTimeOriginal, None)
+        exif_dict.setdefault("0th", {}).pop(piexif.ImageIFD.DateTime, None)
+        piexif.insert(piexif.dump(exif_dict), path)
+
     def test_draft_edits_do_not_modify_file_until_save(self):
         before_bytes = open(self.photo1, "rb").read()
         state = self.window.get_or_create_edit_state(self.photo1)
@@ -245,6 +251,29 @@ class TestImageEditing(unittest.TestCase):
         self.assertEqual(next_state.anchor_corner, "custom")
         self.assertAlmostEqual(next_state.position_norm[0], 0.88, places=2)
         self.assertAlmostEqual(next_state.position_norm[1], 0.82, places=2)
+
+    def test_navigation_does_not_apply_stale_date_focus_out_to_next_photo(self):
+        self._clear_photo_date(self.photo2)
+        self.window.date_entry.setText("February 02, 1999")
+
+        original_load_current_photo = self.window.load_current_photo
+        stale_focus_out_triggered = {"value": False}
+
+        def load_with_stale_focus_out():
+            if self.window.current_photo_index == 1 and not stale_focus_out_triggered["value"]:
+                stale_focus_out_triggered["value"] = True
+                self.window.on_date_focus_out()
+            return original_load_current_photo()
+
+        self.window.load_current_photo = load_with_stale_focus_out
+        self.window._navigate_next()
+
+        self.assertTrue(stale_focus_out_triggered["value"])
+        exif_dict = piexif.load(self.photo2)
+        self.assertNotIn(piexif.ExifIFD.DateTimeOriginal, exif_dict["Exif"])
+        self.assertNotIn(piexif.ImageIFD.DateTime, exif_dict["0th"])
+        self.assertEqual(self.window.current_photo_index, 1)
+        self.assertEqual(self.window.date_entry.text().strip(), "")
 
     def test_stamp_size_controls_and_open_sans_option(self):
         self.window.stamp_enabled_checkbox.setChecked(True)
