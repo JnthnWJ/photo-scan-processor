@@ -130,6 +130,36 @@ class TestImageEditing(unittest.TestCase):
         cropped = apply_photo_adjustments(test_image, edit_state, apply_crop=True)
         self.assertEqual(cropped.size, (50, 50))
 
+    def test_fine_rotation_expands_image_before_crop(self):
+        test_image = Image.new("RGB", (120, 80), color=(128, 128, 128))
+        rotated_state = PhotoEditState(fine_rotation=5.0)
+        rotated = apply_photo_adjustments(test_image, rotated_state, apply_crop=False)
+        self.assertGreater(rotated.width, test_image.width)
+        self.assertGreater(rotated.height, test_image.height)
+
+        cropped_state = PhotoEditState(fine_rotation=5.0, crop_rect_norm=(0.1, 0.1, 0.9, 0.9))
+        cropped = apply_photo_adjustments(test_image, cropped_state, apply_crop=True)
+        self.assertLess(cropped.width, rotated.width)
+        self.assertLess(cropped.height, rotated.height)
+
+    def test_crop_mode_rotation_signal_updates_state_and_save(self):
+        before_bytes = open(self.photo1, "rb").read()
+        self.window.get_or_create_edit_state(self.photo1).crop_rect_norm = (0.0, 0.0, 1.0, 1.0)
+        self.window.enter_crop_mode()
+        self.window.photo_viewer.set_crop_rotation(3.5, emit_signal=True)
+
+        state = self.window.get_or_create_edit_state(self.photo1)
+        self.assertAlmostEqual(state.fine_rotation, 3.5, places=1)
+        self.assertTrue(state.is_dirty)
+
+        self.assertTrue(self.window.save_current_image_edits())
+        after_bytes = open(self.photo1, "rb").read()
+        self.assertNotEqual(before_bytes, after_bytes)
+
+        with Image.open(self.photo1) as saved:
+            self.assertGreater(saved.width, 480)
+            self.assertGreater(saved.height, 320)
+
     def test_navigation_prompt_save_discard_cancel(self):
         # Cancel
         state = self.window.get_or_create_edit_state(self.photo1)

@@ -4,6 +4,7 @@ Photo Metadata Editor - PySide6 Version
 A desktop application for editing metadata of scanned photos with Apple Photos compatibility.
 """
 
+import math
 import os
 import sys
 from typing import List, Optional, Dict, Any, Tuple, Set
@@ -110,6 +111,7 @@ class PhotoEditState:
     saturation: int = 0
     temperature: int = 0
     tint: int = 0
+    fine_rotation: float = 0.0
     crop_rect_norm: Optional[Tuple[float, float, float, float]] = None
     crop_aspect: str = "freeform"
     date_stamp: DateStampState = field(default_factory=DateStampState)
@@ -122,6 +124,7 @@ class PhotoEditState:
             self.saturation != 0,
             self.temperature != 0,
             self.tint != 0,
+            abs(self.fine_rotation) >= 0.01,
             self.crop_rect_norm is not None,
             self.date_stamp.has_effective_changes(),
         ])
@@ -167,6 +170,12 @@ def normalized_rect_to_pixel_box(
     return (px_left, px_top, px_right, px_bottom)
 
 
+def clamp_fine_rotation(angle_degrees: float, limit_degrees: float = 45.0) -> float:
+    """Clamp small-angle crop rotation to a sane straighten range."""
+    angle = float(angle_degrees)
+    return max(-limit_degrees, min(limit_degrees, angle))
+
+
 def _apply_channel_gains(pil_image: Image.Image, r_gain: float, g_gain: float, b_gain: float) -> Image.Image:
     """Apply per-channel gains with LUTs for high quality and speed."""
     if pil_image.mode != "RGB":
@@ -205,7 +214,7 @@ def apply_photo_adjustments(
         resized_size = (max(1, int(working.size[0] * ratio)), max(1, int(working.size[1] * ratio)))
         working = working.resize(resized_size, Image.Resampling.LANCZOS)
 
-    # Adjustment order: brightness -> contrast -> saturation -> white balance -> tint -> crop
+    # Adjustment order: brightness -> contrast -> saturation -> white balance -> tint -> straighten -> crop
     if edit_state.brightness != 0:
         working = ImageEnhance.Brightness(working).enhance(max(0.0, 1.0 + (edit_state.brightness / 100.0)))
     if edit_state.contrast != 0:
@@ -219,6 +228,16 @@ def apply_photo_adjustments(
     green_gain = 1.0 + (tint * 0.20)
     blue_gain = 1.0 - (temperature * 0.25) - (tint * 0.05)
     working = _apply_channel_gains(working, red_gain, green_gain, blue_gain)
+
+    fine_rotation = clamp_fine_rotation(edit_state.fine_rotation)
+    if abs(fine_rotation) >= 0.01:
+        # Positive values match the existing clockwise rotation toolbar semantics.
+        working = working.rotate(
+            -fine_rotation,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor=(0, 0, 0),
+        )
 
     if apply_crop and edit_state.crop_rect_norm:
         crop_box = normalized_rect_to_pixel_box(edit_state.crop_rect_norm, working.width, working.height)
@@ -338,6 +357,7 @@ class ZoomableImageViewer(QGraphicsView):
     """A zoomable and pannable image viewer widget."""
     cropChanged = Signal(object)
     cropModeChanged = Signal(bool)
+    cropRotationChanged = Signal(float)
     stampMoved = Signal(object)
 
     def __init__(self, parent=None):
@@ -372,12 +392,16 @@ class ZoomableImageViewer(QGraphicsView):
         self.crop_mode_enabled = False
         self.crop_rect_scene: Optional[QRectF] = None
         self.crop_aspect_ratio: Optional[float] = None
+        self.crop_rotation_degrees = 0.0
         self._crop_drag_mode = None
         self._crop_start_scene_pos = None
         self._crop_start_rect = None
         self._crop_active_handle = None
         self._crop_min_size = 20.0
         self._handle_size = 12.0
+        self._rotation_handle_size = 18.0
+        self._rotation_handle_offset = 34.0
+        self._crop_rotation_limit = 45.0
         self.stamp_rect_scene: Optional[QRectF] = None
         self.stamp_drag_enabled = False
         self._stamp_drag_mode = False
@@ -409,6 +433,7 @@ class ZoomableImageViewer(QGraphicsView):
         self.has_image = False
         self.crop_rect_scene = None
         self.crop_mode_enabled = False
+        self.crop_rotation_degrees = 0.0
         self.stamp_rect_scene = None
         self.stamp_drag_enabled = False
         self._stamp_drag_mode = False
@@ -517,10 +542,22 @@ class ZoomableImageViewer(QGraphicsView):
             if rect_norm:
                 self.cropChanged.emit(rect_norm)
 
+    def set_crop_rotation(self, angle_degrees: float, emit_signal=True):
+        """Set the fine crop rotation and optionally notify listeners."""
+        clamped = clamp_fine_rotation(angle_degrees, self._crop_rotation_limit)
+        if abs(clamped - self.crop_rotation_degrees) < 0.01:
+            return
+
+        self.crop_rotation_degrees = clamped
+        self.viewport().update()
+        if emit_signal:
+            self.cropRotationChanged.emit(clamped)
+
     def enable_crop_mode(
         self,
         rect_norm: Optional[Tuple[float, float, float, float]] = None,
-        aspect_ratio: Optional[float] = None
+        aspect_ratio: Optional[float] = None,
+        rotation_degrees: float = 0.0,
     ):
         """Enable interactive crop mode."""
         if not self.image_item:
@@ -528,6 +565,7 @@ class ZoomableImageViewer(QGraphicsView):
 
         self.crop_mode_enabled = True
         self.crop_aspect_ratio = aspect_ratio
+        self.crop_rotation_degrees = clamp_fine_rotation(rotation_degrees, self._crop_rotation_limit)
         self.setDragMode(QGraphicsView.NoDrag)
 
         if rect_norm:
@@ -615,6 +653,16 @@ class ZoomableImageViewer(QGraphicsView):
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(self.crop_rect_scene)
 
+        rotation_handle_rect = self._rotation_handle_rect()
+        if rotation_handle_rect:
+            top_center = self.crop_rect_scene.center()
+            top_center.setY(self.crop_rect_scene.top())
+            painter.drawLine(top_center, rotation_handle_rect.center())
+            painter.setBrush(QColor(255, 214, 10))
+            painter.drawEllipse(rotation_handle_rect)
+            angle_text_rect = QRectF(rotation_handle_rect.center().x() - 28, rotation_handle_rect.bottom() + 4, 56, 18)
+            painter.drawText(angle_text_rect, Qt.AlignCenter, f"{self.crop_rotation_degrees:+.1f}°")
+
         for handle_rect in self._crop_handle_rects().values():
             painter.fillRect(handle_rect, QColor(255, 214, 10))
             painter.setPen(QPen(QColor(30, 30, 30), 1))
@@ -635,11 +683,43 @@ class ZoomableImageViewer(QGraphicsView):
             "bottom_right": QRectF(rect.right() - half, rect.bottom() - half, self._handle_size, self._handle_size),
         }
 
+    def _rotation_handle_rect(self) -> Optional[QRectF]:
+        if not self.crop_rect_scene:
+            return None
+
+        half = self._rotation_handle_size / 2.0
+        center = self.crop_rect_scene.center()
+        image_rect = self._scene_image_rect()
+        min_center_y = (image_rect.top() + half + 4.0) if image_rect else half
+        handle_center_y = max(min_center_y, self.crop_rect_scene.top() - self._rotation_handle_offset)
+        return QRectF(center.x() - half, handle_center_y - half, self._rotation_handle_size, self._rotation_handle_size)
+
     def _hit_test_handle(self, scene_pos) -> Optional[str]:
         for handle_name, handle_rect in self._crop_handle_rects().items():
             if handle_rect.contains(scene_pos):
                 return handle_name
         return None
+
+    def _hit_test_rotation_handle(self, scene_pos) -> bool:
+        handle_rect = self._rotation_handle_rect()
+        return bool(handle_rect and handle_rect.contains(scene_pos))
+
+    def _rotation_angle_from_scene_pos(self, scene_pos) -> float:
+        if not self.crop_rect_scene:
+            return self.crop_rotation_degrees
+
+        center = self.crop_rect_scene.center()
+        dx = scene_pos.x() - center.x()
+        dy = scene_pos.y() - center.y()
+        if abs(dx) < 0.001 and abs(dy) < 0.001:
+            return self.crop_rotation_degrees
+
+        angle = math.degrees(math.atan2(dy, dx)) + 90.0
+        while angle <= -180.0:
+            angle += 360.0
+        while angle > 180.0:
+            angle -= 360.0
+        return clamp_fine_rotation(angle, self._crop_rotation_limit)
 
     def _resize_from_handle(self, handle_name: str, scene_pos) -> Optional[QRectF]:
         if not self._crop_start_rect:
@@ -747,6 +827,15 @@ class ZoomableImageViewer(QGraphicsView):
         """Handle mouse press events."""
         if self.crop_mode_enabled and self.has_image and event.button() == Qt.LeftButton:
             scene_pos = self.mapToScene(event.position().toPoint())
+            if self._hit_test_rotation_handle(scene_pos):
+                self._crop_drag_mode = "rotate"
+                self._crop_active_handle = None
+                self._crop_start_scene_pos = scene_pos
+                self._crop_start_rect = QRectF(self.crop_rect_scene) if self.crop_rect_scene else None
+                self.viewport().setCursor(QCursor(Qt.ClosedHandCursor))
+                event.accept()
+                return
+
             self._crop_active_handle = self._hit_test_handle(scene_pos)
             self._crop_start_scene_pos = scene_pos
             self._crop_start_rect = QRectF(self.crop_rect_scene) if self.crop_rect_scene else None
@@ -795,6 +884,7 @@ class ZoomableImageViewer(QGraphicsView):
             self._crop_active_handle = None
             self._crop_start_scene_pos = None
             self._crop_start_rect = None
+            self.viewport().unsetCursor()
             event.accept()
             return
 
@@ -825,6 +915,11 @@ class ZoomableImageViewer(QGraphicsView):
             delta = scene_pos - self._crop_start_scene_pos
             moved_rect = self._crop_start_rect.translated(delta.x(), delta.y())
             self._set_crop_rect_scene(moved_rect, emit_signal=True)
+            event.accept()
+            return
+
+        if self.crop_mode_enabled and self._crop_drag_mode == "rotate":
+            self.set_crop_rotation(self._rotation_angle_from_scene_pos(scene_pos), emit_signal=True)
             event.accept()
             return
 
@@ -871,6 +966,11 @@ class ZoomableImageViewer(QGraphicsView):
                 new_rect = QRectF(left, top, width, height)
 
             self._set_crop_rect_scene(new_rect, emit_signal=True)
+            event.accept()
+            return
+
+        if self.crop_mode_enabled and self._hit_test_rotation_handle(scene_pos):
+            self.viewport().setCursor(QCursor(Qt.OpenHandCursor))
             event.accept()
             return
 
@@ -1096,6 +1196,7 @@ class PhotoMetadataEditor(QMainWindow):
         self.photo_viewer = ZoomableImageViewer()
         self.photo_viewer.setMinimumSize(400, 300)
         self.photo_viewer.cropChanged.connect(self.on_crop_rect_changed)
+        self.photo_viewer.cropRotationChanged.connect(self.on_crop_rotation_changed)
         self.photo_viewer.stampMoved.connect(self.on_stamp_rect_moved)
         photo_layout.addWidget(self.photo_viewer)
 
@@ -1188,8 +1289,16 @@ class PhotoMetadataEditor(QMainWindow):
             self.crop_aspect_combo.addItem(label, aspect_key)
         self.crop_aspect_combo.currentIndexChanged.connect(self.on_crop_aspect_changed)
         crop_layout.addWidget(self.crop_aspect_combo)
+        crop_layout.addSpacing(12)
+        crop_layout.addWidget(QLabel("Straighten"))
+        self.crop_rotation_value_label = QLabel("0.0°")
+        self.crop_rotation_value_label.setMinimumWidth(46)
+        crop_layout.addWidget(self.crop_rotation_value_label)
+        self.crop_reset_rotation_btn = QPushButton("Reset Angle")
+        self.crop_reset_rotation_btn.clicked.connect(self.reset_crop_rotation)
+        crop_layout.addWidget(self.crop_reset_rotation_btn)
         crop_layout.addStretch()
-        self.crop_hint_label = QLabel("Drag to move/resize crop")
+        self.crop_hint_label = QLabel("Drag box to crop or top handle to straighten")
         self.crop_hint_label.setStyleSheet("QLabel { color: gray; font-size: 11px; }")
         crop_layout.addWidget(self.crop_hint_label)
         self.crop_panel.hide()
@@ -1351,6 +1460,7 @@ class PhotoMetadataEditor(QMainWindow):
             self.crop_btn,
             self.reset_edits_btn,
             self.save_edits_btn,
+            self.crop_reset_rotation_btn,
         ]:
             button.setEnabled(enabled)
 
@@ -1391,6 +1501,11 @@ class PhotoMetadataEditor(QMainWindow):
             self.crop_aspect_combo.blockSignals(True)
             self.crop_aspect_combo.setCurrentIndex(idx)
             self.crop_aspect_combo.blockSignals(False)
+
+    def _set_crop_rotation_label(self, angle_degrees: float):
+        """Reflect the current fine crop rotation in the crop toolbar."""
+        if hasattr(self, "crop_rotation_value_label"):
+            self.crop_rotation_value_label.setText(f"{clamp_fine_rotation(angle_degrees):+.1f}°")
 
     def _stamp_font_for_pil(self, font_key: str, font_size: int):
         """Resolve the preferred PIL font for rendering the date stamp."""
@@ -1785,9 +1900,11 @@ class PhotoMetadataEditor(QMainWindow):
             state.crop_aspect = aspect_key
 
         self._set_crop_combo_value(aspect_key)
+        self._set_crop_rotation_label(state.fine_rotation)
         self.photo_viewer.enable_crop_mode(
             rect_norm=rect_norm,
             aspect_ratio=self._aspect_ratio_for_key(aspect_key),
+            rotation_degrees=state.fine_rotation,
         )
         if rect_norm:
             self.photo_viewer.set_crop_rect_normalized(rect_norm, emit_signal=False)
@@ -1836,6 +1953,34 @@ class PhotoMetadataEditor(QMainWindow):
         if not self.photo_viewer.crop_mode_enabled:
             self.preview_render_timer.start(35)
 
+    def on_crop_rotation_changed(self, angle_degrees: float):
+        """Sync fine straighten rotation from viewer to draft state."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        state.fine_rotation = clamp_fine_rotation(angle_degrees)
+        self._set_state_dirty(state)
+        self._set_crop_rotation_label(state.fine_rotation)
+        self.preview_render_timer.start(15)
+
+    def reset_crop_rotation(self):
+        """Reset the fine crop rotation back to zero degrees."""
+        photo_path = self._current_photo_path()
+        if not photo_path:
+            return
+
+        if self.photo_viewer.crop_mode_enabled:
+            self.photo_viewer.set_crop_rotation(0.0, emit_signal=True)
+            return
+
+        state = self.get_or_create_edit_state(photo_path)
+        state.fine_rotation = 0.0
+        self._set_state_dirty(state)
+        self._set_crop_rotation_label(0.0)
+        self.preview_render_timer.start(15)
+
     def _current_preview_dimension(self) -> int:
         viewport = self.photo_viewer.viewport().size()
         longest = max(1, max(viewport.width(), viewport.height()))
@@ -1864,8 +2009,10 @@ class PhotoMetadataEditor(QMainWindow):
 
         if self.photo_viewer.crop_mode_enabled:
             self.photo_viewer.set_crop_aspect_ratio(self._aspect_ratio_for_key(state.crop_aspect))
+            self.photo_viewer.set_crop_rotation(state.fine_rotation, emit_signal=False)
             if state.crop_rect_norm:
                 self.photo_viewer.set_crop_rect_normalized(state.crop_rect_norm, emit_signal=False)
+        self._set_crop_rotation_label(state.fine_rotation)
 
         self.placeholder_label.hide()
         self.photo_viewer.show()
@@ -2840,6 +2987,7 @@ The application creates backup files (.backup) before modifying originals."""
             # Reset manual rotation for new photo
             self.manual_rotation = 0
             self.rotation_label.setText("0°")
+            self._set_crop_rotation_label(0.0)
 
             # Enable rotation buttons
             self.rotate_left_btn.setEnabled(True)
@@ -2902,6 +3050,7 @@ The application creates backup files (.backup) before modifying originals."""
             self.rotate_right_btn.setEnabled(False)
             self.date_stamp_btn.setEnabled(False)
             self.rotation_label.setText("0°")
+            self._set_crop_rotation_label(0.0)
         if hasattr(self, 'brightness_btn'):
             self._set_edit_controls_enabled(False)
             self.adjustment_panel.hide()
